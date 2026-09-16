@@ -52,7 +52,7 @@ fn python_routes_history_cache_top_and_mixed_mass() {
         .stdout
     );
     let report: Value = serde_json::from_slice(&cold.stdout).unwrap();
-    assert_eq!(report["metric"]["version"], "erosion-v2");
+    assert_eq!(report["metric"]["version"], "erosion-v3");
     let snapshot = &report["snapshots"][0];
     let complex_mass = 11.0 * 11.0_f64.sqrt();
     let total = complex_mass + 10.0 * 10.0_f64.sqrt() + 1.0;

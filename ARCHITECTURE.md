@@ -13,9 +13,10 @@ server, plugin loader, AST-Grep dependency, or project-code execution.
 - `history.rs`: UTC duration/calendar arithmetic and checkpoint-to-commit
   selection. Repository birth is represented by absent commits, not zero scores.
 - `config.rs`: one invocation's frozen include/exclude scope and fingerprint.
-- `languages/`: language routing and adapter interface. JavaScript-family and
-  Python adapters select bundled grammars and define callable, decision, naming,
-  ignored-source, and grammar-validation rules. `languages/tree.rs` owns their shared traversal,
+- `languages/`: language routing and adapter interface. JavaScript-family,
+  Python, Rust, and Gleam adapters select bundled grammars and define callable,
+  decision, naming, ignored-source, and grammar-validation rules.
+  `languages/tree.rs` owns their shared traversal,
   diagnostics, nested-decision aggregation, and source-line accounting.
 - `metrics.rs`: language-independent measurement records, complexity threshold,
   function mass, and compensated summation.
@@ -49,9 +50,10 @@ language routing, parser versions, metric version, and cache schema. Changing
 counting behavior must preserve cache invalidation and update the documented
 metric contract/version when semantics change.
 
-The `erosion-v2` profile adds Python to default coverage while preserving JS/TS
-rules. Comparisons require the same profile and scope across checkpoints; an old
-JS-only report is not directly comparable with a new mixed-language default.
+The `erosion-v3` profile adds Rust and Gleam to default coverage while preserving
+JavaScript-family and Python rules. Comparisons require the same profile and
+scope across checkpoints; reports from older profiles are not directly
+comparable with the new mixed-language default.
 
 ## Repository and temporal invariants
 
