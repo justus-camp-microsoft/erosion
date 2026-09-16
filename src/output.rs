@@ -33,26 +33,45 @@ fn table(report: &Report) -> Result<Vec<u8>> {
             measure(&mut text, snapshot)?;
         }
         "delta" => {
-            let [from, to] = report.snapshots.as_slice() else {
-                bail!("Delta output requires exactly two snapshots");
-            };
-            match to.change_pp {
-                Some(change) => writeln!(
-                    text,
-                    "Erosion delta (TO - FROM): {change:+.2} percentage points\n"
-                )?,
-                None => writeln!(
-                    text,
-                    "Erosion delta (TO - FROM): not measurable (one or both scores unavailable)\n"
-                )?,
+            if let [from, to] = report.snapshots.as_slice() {
+                match to.change_pp {
+                    Some(change) => writeln!(
+                        text,
+                        "Erosion delta (TO - FROM): {change:+.2} percentage points\n"
+                    )?,
+                    None => writeln!(
+                        text,
+                        "Erosion delta (TO - FROM): not measurable (one or both scores unavailable)\n"
+                    )?,
+                }
+                from.commit
+                    .as_ref()
+                    .context("Delta FROM commit is missing")?;
+                to.commit.as_ref().context("Delta TO commit is missing")?;
+                header(&mut text, "Snapshot")?;
+                row(&mut text, "FROM", from)?;
+                row(&mut text, "TO", to)?;
+            } else {
+                if report.snapshots.is_empty() {
+                    bail!("Delta output requires at least one snapshot");
+                }
+                writeln!(text, "Erosion delta per commit\n")?;
+                header(&mut text, "Position")?;
+                let last = report.snapshots.len() - 1;
+                for (index, snapshot) in report.snapshots.iter().enumerate() {
+                    snapshot
+                        .commit
+                        .as_ref()
+                        .context("Delta commit is missing")?;
+                    let label = match (index, last) {
+                        (0, 0) => "FROM/TO".to_owned(),
+                        (0, _) => "FROM".to_owned(),
+                        (index, last) if index == last => "TO".to_owned(),
+                        _ => index.to_string(),
+                    };
+                    row(&mut text, &label, snapshot)?;
+                }
             }
-            from.commit
-                .as_ref()
-                .context("Delta FROM commit is missing")?;
-            to.commit.as_ref().context("Delta TO commit is missing")?;
-            header(&mut text, "Snapshot")?;
-            row(&mut text, "FROM", from)?;
-            row(&mut text, "TO", to)?;
         }
         "history" => {
             writeln!(text, "Erosion history\n")?;
