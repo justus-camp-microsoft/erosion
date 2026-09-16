@@ -56,3 +56,6 @@ The first commit has no change value. Each later commit reports its erosion
 minus the previous commit's erosion. `FROM` must be on `TO`'s first-parent
 chain. Commit order follows that chain, not commit timestamps. This mode
 requires complete history and rejects shallow repositories.
+
+Ranges of 10 or more commits show progress on an interactive terminal.
+Use `--verbose` to keep one progress line per commit in redirected logs.

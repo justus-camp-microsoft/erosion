@@ -145,6 +145,11 @@ pub struct Analyzer {
     adapters: HashMap<Language, Box<dyn LanguageAdapter>>,
 }
 
+struct ReportSettings {
+    mode: &'static str,
+    top: usize,
+}
+
 impl Analyzer {
     pub fn new(cache: Cache) -> Self {
         Self {
@@ -284,10 +289,49 @@ impl Analyzer {
         mode: &'static str,
         top: usize,
     ) -> Result<Report> {
+        self.build_report(
+            repo,
+            scope,
+            reference,
+            checkpoints,
+            ReportSettings { mode, top },
+            |_, _, _| Ok(()),
+        )
+    }
+
+    pub fn report_with_progress(
+        &mut self,
+        repo: &Repository,
+        scope: &Scope,
+        reference: Commit,
+        checkpoints: &[Checkpoint],
+        mode: &'static str,
+        mut progress: impl FnMut(usize, usize, &Checkpoint) -> Result<()>,
+    ) -> Result<Report> {
+        self.build_report(
+            repo,
+            scope,
+            reference,
+            checkpoints,
+            ReportSettings { mode, top: 0 },
+            &mut progress,
+        )
+    }
+
+    fn build_report(
+        &mut self,
+        repo: &Repository,
+        scope: &Scope,
+        reference: Commit,
+        checkpoints: &[Checkpoint],
+        settings: ReportSettings,
+        mut progress: impl FnMut(usize, usize, &Checkpoint) -> Result<()>,
+    ) -> Result<Report> {
         let mut snapshots = Vec::new();
         let mut previous = None;
-        for checkpoint in checkpoints {
-            let mut snapshot = self.snapshot(repo, scope, checkpoint, top)?;
+        for (index, checkpoint) in checkpoints.iter().enumerate() {
+            progress(index + 1, checkpoints.len(), checkpoint)?;
+            let mut snapshot = self.snapshot(repo, scope, checkpoint, settings.top)?;
             snapshot.change_pp = snapshot
                 .erosion_pct
                 .zip(previous)
@@ -298,7 +342,7 @@ impl Analyzer {
         Ok(Report {
             schema_version: 1,
             tool_version: env!("CARGO_PKG_VERSION"),
-            mode,
+            mode: settings.mode,
             reference,
             metric: MetricIdentity {
                 name: "erosion",

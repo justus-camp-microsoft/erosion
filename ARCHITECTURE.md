@@ -96,6 +96,9 @@ snapshot's `change_pp` is its erosion minus the preceding commit's erosion.
 Merged side-branch commits are excluded. Shallow history is rejected rather
 than reported as a truncated range. JSON and CSV use the same ordered snapshot
 records as other modes.
+For ranges of 10 or more commits, the CLI uses the report progress callback to
+update one stderr line on a terminal. `--verbose` emits persistent progress
+lines when stderr is redirected. Quiet redirected output remains unchanged.
 
 ## Results and persistence
 

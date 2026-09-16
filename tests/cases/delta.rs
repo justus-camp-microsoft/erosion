@@ -449,6 +449,39 @@ fn all_commits_reports_each_adjacent_first_parent_delta_in_all_formats() {
 }
 
 #[test]
+fn all_commits_reports_progress_for_large_ranges() {
+    let repo = repository(&[("a.py", "def f(): return 1\n")]);
+    let from = git(repo.path(), &["rev-parse", "HEAD"]);
+    for _ in 1..10 {
+        git(repo.path(), &["commit", "--allow-empty", "-qm", "step"]);
+    }
+    let to = git(repo.path(), &["rev-parse", "HEAD"]);
+
+    let quiet = run(
+        repo.path(),
+        &["delta", &from, &to, "--all-commits", "--no-cache"],
+    );
+    assert!(quiet.status.success());
+    assert!(quiet.stderr.is_empty());
+
+    let verbose = run(
+        repo.path(),
+        &[
+            "delta",
+            &from,
+            &to,
+            "--all-commits",
+            "--no-cache",
+            "--verbose",
+        ],
+    );
+    assert!(verbose.status.success());
+    let stderr = String::from_utf8(verbose.stderr).unwrap();
+    assert!(stderr.contains(&format!("Processing commit 1/10: {}", &from[..10])));
+    assert!(stderr.contains(&format!("Processing commit 10/10: {}", &to[..10])));
+}
+
+#[test]
 fn all_commits_excludes_side_branches_and_requires_first_parent_ancestry() {
     let repo = repository(&[("a.py", "def f(): return 1\n")]);
     let root = git(repo.path(), &["rev-parse", "HEAD"]);
