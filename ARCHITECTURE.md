@@ -89,6 +89,14 @@ TO minus FROM. Both sides share the frozen scope and blob cache; an absent
 score on either side makes the difference unmeasurable. Parse-failure diagnostics
 include commit identity so failures remain distinguishable even at equal timestamps.
 
+`delta FROM TO --all-commits` instead traverses TO's complete first-parent
+history, requires FROM on that chain, and measures the inclusive range in
+oldest-to-newest topology order. The first snapshot has no change; each later
+snapshot's `change_pp` is its erosion minus the preceding commit's erosion.
+Merged side-branch commits are excluded. Shallow history is rejected rather
+than reported as a truncated range. JSON and CSV use the same ordered snapshot
+records as other modes.
+
 ## Results and persistence
 
 Each result includes full commit identity/timestamp, requested cutoff,

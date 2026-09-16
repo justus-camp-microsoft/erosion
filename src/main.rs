@@ -56,6 +56,9 @@ enum Command {
         from: String,
         /// Target commit or revision (e.g. HEAD).
         to: String,
+        /// Calculate erosion for every commit on the inclusive first-parent range.
+        #[arg(long)]
+        all_commits: bool,
         #[command(flatten)]
         common: Common,
     },
@@ -119,10 +122,29 @@ fn run(cli: Cli) -> Result<()> {
             let checkpoints = history::checkpoints(&chain, since, until.as_deref(), every)?;
             ("history", reference, checkpoints)
         }
-        Command::Delta { from, to, .. } => {
+        Command::Delta {
+            from,
+            to,
+            all_commits,
+            ..
+        } => {
             let baseline = repo.resolve(from).context("Resolving FROM revision")?;
             let reference = repo.resolve(to).context("Resolving TO revision")?;
-            let checkpoints = [baseline, reference.clone()]
+            let commits = if *all_commits {
+                let chain = repo.first_parent_chain(&reference)?;
+                let Some(from_index) = chain.iter().position(|commit| commit.sha == baseline.sha)
+                else {
+                    anyhow::bail!(
+                        "FROM revision {} is not on the first-parent chain of TO revision {}",
+                        baseline.sha,
+                        reference.sha
+                    );
+                };
+                chain[..=from_index].iter().rev().cloned().collect()
+            } else {
+                vec![baseline, reference.clone()]
+            };
+            let checkpoints = commits
                 .into_iter()
                 .map(|commit| Checkpoint {
                     cutoff: commit.committed_at,

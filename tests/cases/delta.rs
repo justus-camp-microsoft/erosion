@@ -363,6 +363,164 @@ fn unrelated_revisions_do_not_traverse_or_reorder_history() {
 }
 
 #[test]
+fn all_commits_reports_each_adjacent_first_parent_delta_in_all_formats() {
+    let repo = repository(&[("a.py", "def f(): return 1\n")]);
+    let from = git(repo.path(), &["rev-parse", "HEAD"]);
+    fs::write(
+        repo.path().join("a.py"),
+        format!("def f(x):\n{}", "    if x: work()\n".repeat(10)),
+    )
+    .unwrap();
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-qm", "increase erosion"]);
+    let middle = git(repo.path(), &["rev-parse", "HEAD"]);
+    fs::write(repo.path().join("a.py"), "def f(): return 1\n").unwrap();
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-qm", "decrease erosion"]);
+    let to = git(repo.path(), &["rev-parse", "HEAD"]);
+
+    let report = successful_json(
+        repo.path(),
+        &[
+            "delta",
+            &from,
+            &to,
+            "--all-commits",
+            "--format",
+            "json",
+            "--no-cache",
+        ],
+    );
+    assert_eq!(report["mode"], "delta");
+    assert_eq!(report["reference"]["sha"], to);
+    let rows = report["snapshots"].as_array().unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0]["commit"]["sha"], from);
+    assert_eq!(rows[1]["commit"]["sha"], middle);
+    assert_eq!(rows[2]["commit"]["sha"], to);
+    assert!(rows[0]["change_pp"].is_null());
+    assert_close(&rows[1]["change_pp"], 100.0);
+    assert_close(&rows[2]["change_pp"], -100.0);
+
+    let table = run(
+        repo.path(),
+        &["delta", &from, &to, "--all-commits", "--no-cache"],
+    );
+    assert!(table.status.success());
+    let text = String::from_utf8(table.stdout).unwrap();
+    assert!(text.starts_with("Erosion delta per commit\n"));
+    assert!(text.contains("FROM") && text.contains("TO"));
+    assert!(text.contains("+100.00pp") && text.contains("-100.00pp"));
+    for sha in [&from, &middle, &to] {
+        assert!(text.contains(&sha[..10]));
+    }
+
+    let csv = run(
+        repo.path(),
+        &[
+            "delta",
+            &from,
+            &to,
+            "--all-commits",
+            "--format",
+            "csv",
+            "--no-cache",
+        ],
+    );
+    assert!(csv.status.success());
+    let mut reader = csv::Reader::from_reader(csv.stdout.as_slice());
+    let headers = reader.headers().unwrap().clone();
+    let commit = headers
+        .iter()
+        .position(|column| column == "commit")
+        .unwrap();
+    let change = headers
+        .iter()
+        .position(|column| column == "change_pp")
+        .unwrap();
+    let rows: Vec<_> = reader.records().map(Result::unwrap).collect();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(&rows[0][commit], from);
+    assert_eq!(&rows[1][commit], middle);
+    assert_eq!(&rows[2][commit], to);
+    assert!(rows[0][change].is_empty());
+    assert_eq!(&rows[1][change], "100");
+    assert_eq!(&rows[2][change], "-100");
+}
+
+#[test]
+fn all_commits_excludes_side_branches_and_requires_first_parent_ancestry() {
+    let repo = repository(&[("a.py", "def f(): return 1\n")]);
+    let root = git(repo.path(), &["rev-parse", "HEAD"]);
+    let tree = git(repo.path(), &["rev-parse", "HEAD^{tree}"]);
+    let main = git(
+        repo.path(),
+        &["commit-tree", &tree, "-p", &root, "-m", "main"],
+    );
+    let side = git(
+        repo.path(),
+        &["commit-tree", &tree, "-p", &root, "-m", "side"],
+    );
+    let merge = git(
+        repo.path(),
+        &[
+            "commit-tree",
+            &tree,
+            "-p",
+            &main,
+            "-p",
+            &side,
+            "-m",
+            "merge",
+        ],
+    );
+    git(repo.path(), &["update-ref", "refs/heads/main", &merge]);
+
+    let report = successful_json(
+        repo.path(),
+        &[
+            "delta",
+            &root,
+            &merge,
+            "--all-commits",
+            "--format",
+            "json",
+            "--no-cache",
+        ],
+    );
+    let commits: Vec<_> = report["snapshots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|snapshot| snapshot["commit"]["sha"].as_str().unwrap())
+        .collect();
+    assert_eq!(commits, [&root, &main, &merge]);
+    assert!(!commits.contains(&side.as_str()));
+
+    let outside = tempfile::tempdir().unwrap();
+    let cache = outside.path().join("must-not-exist");
+    let failure = run(
+        repo.path(),
+        &[
+            "delta",
+            &side,
+            &merge,
+            "--all-commits",
+            "--cache-dir",
+            cache.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(failure.status.code(), Some(1));
+    assert!(failure.stdout.is_empty());
+    assert!(
+        String::from_utf8(failure.stderr)
+            .unwrap()
+            .contains("is not on the first-parent chain")
+    );
+    assert!(!cache.exists());
+}
+
+#[test]
 fn invalid_revisions_and_arguments_emit_no_results_or_cache() {
     let repo = repository(&[("a.py", "def f(): return 1\n")]);
     let outside = tempfile::tempdir().unwrap();

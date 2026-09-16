@@ -38,3 +38,21 @@ Options:
   -h, --help     Print help
   -V, --version  Print version
 ```
+
+Compare two committed snapshots:
+
+```console
+erosion delta HEAD~10 HEAD
+```
+
+Add `--all-commits` to measure every commit on the inclusive first-parent path
+from `FROM` to `TO`:
+
+```console
+erosion delta HEAD~10 HEAD --all-commits
+```
+
+The first commit has no change value. Each later commit reports its erosion
+minus the previous commit's erosion. `FROM` must be on `TO`'s first-parent
+chain. Commit order follows that chain, not commit timestamps. This mode
+requires complete history and rejects shallow repositories.
