@@ -1,0 +1,26 @@
+[package]
+name = "erosion"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Read-only, language-aware code erosion measurements across Git history"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+csv = "1"
+dirs = "6"
+globset = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+toml = "0.9"
+tree-sitter = "=0.25.2"
+tree-sitter-javascript = "=0.25.0"
+tree-sitter-python = "=0.25.0"
+tree-sitter-typescript = "=0.23.2"
+
+[lints.clippy]
+all = "warn"
