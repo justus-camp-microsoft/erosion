@@ -15,6 +15,9 @@ mod delta;
 #[path = "cases/repo_path.rs"]
 mod repo_path;
 
+#[path = "cases/rust_gleam.rs"]
+mod rust_gleam;
+
 #[path = "cases/output.rs"]
 mod output;
 
@@ -92,7 +95,7 @@ fn adapters_metric_boundary_and_committed_source_only() {
     let repo = repository(&[
         ("a.ts", &ten),
         ("b.ts", &eleven),
-        ("notes.rs", "// unsupported"),
+        ("notes.txt", "unsupported"),
     ]);
     let before = git(repo.path(), &["rev-parse", "HEAD"]);
     fs::write(repo.path().join("a.ts"), "function { dirty source").unwrap();

@@ -35,6 +35,8 @@ impl JavaScriptAdapter {
             Language::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
             Language::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
             Language::Python => bail!("Python requires its own language adapter"),
+            Language::Rust => bail!("Rust requires its own language adapter"),
+            Language::Gleam => bail!("Gleam requires its own language adapter"),
         };
         for kind in CALLABLES
             .iter()

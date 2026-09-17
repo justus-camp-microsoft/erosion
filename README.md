@@ -24,6 +24,14 @@ cargo install --locked --path .
 The binary embeds the parsers. No Tree-sitter CLI, AST-Grep, Node, or Python
 installation is needed at runtime.
 
+## Supported languages
+
+- JavaScript: `.js`, `.jsx`, `.mjs`, `.cjs`
+- TypeScript: `.ts`, `.mts`, `.cts`, `.tsx`
+- Python: `.py`, `.pyw`, `.pyi`
+- Rust: `.rs`
+- Gleam: `.gleam`
+
 ## Usage
 ```
 Usage: erosion <COMMAND>

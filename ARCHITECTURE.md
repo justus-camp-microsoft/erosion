@@ -13,9 +13,10 @@ server, plugin loader, AST-Grep dependency, or project-code execution.
 - `history.rs`: UTC duration/calendar arithmetic and checkpoint-to-commit
   selection. Repository birth is represented by absent commits, not zero scores.
 - `config.rs`: one invocation's frozen include/exclude scope and fingerprint.
-- `languages/`: language routing and adapter interface. JavaScript-family and
-  Python adapters select bundled grammars and define callable, decision, naming,
-  ignored-source, and grammar-validation rules. `languages/tree.rs` owns their shared traversal,
+- `languages/`: language routing and adapter interface. JavaScript-family,
+  Python, Rust, and Gleam adapters select bundled grammars and define callable,
+  decision, naming, ignored-source, and grammar-validation rules.
+  `languages/tree.rs` owns their shared traversal,
   diagnostics, nested-decision aggregation, and source-line accounting.
 - `metrics.rs`: language-independent measurement records, complexity threshold,
   function mass, and compensated summation.
@@ -41,8 +42,13 @@ The analyzer walks syntax trees iteratively. SLOC uses LF-aligned file-level
 source-line membership intersected with each callable's inclusive line span.
 Comment-only, blank, and punctuation-only lines do not contribute. Python also
 excludes scope-leading ordinary string expressions as docstrings, but retains
-data strings. Language-specific rules are documented in README.md; cross-language
-aggregation sums mass rather than averaging percentages.
+data strings. Cross-language aggregation sums mass rather than averaging percentages.
+
+Rust includes functions and closures; decisions include loops, `if`, non-wildcard
+`match` arms, `let ... else`, and short-circuit boolean operators. Gleam includes
+functions and anonymous functions; decisions include non-catch-all `case` clauses,
+guarded clauses, assertions, and short-circuit boolean operators. Comments do not
+count as source lines.
 
 Parser versions are pinned. The analyzer identity covers measurement source,
 language routing, parser versions, metric version, and cache schema. TypeScript/TSX
@@ -59,9 +65,10 @@ strict diagnostics rather than rewriting source or ignoring error nodes. Changin
 counting behavior must preserve cache invalidation and update the documented
 metric contract/version when semantics change.
 
-The `erosion-v2` profile adds Python to default coverage while preserving JS/TS
-rules. Comparisons require the same profile and scope across checkpoints; an old
-JS-only report is not directly comparable with a new mixed-language default.
+The `erosion-v3` profile adds Rust and Gleam to default coverage while preserving
+JavaScript-family and Python rules. Comparisons require the same profile and
+scope across checkpoints; reports from older profiles are not directly
+comparable with the new mixed-language default.
 
 ## Repository and temporal invariants
 

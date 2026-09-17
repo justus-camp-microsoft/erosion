@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-pub const METRIC_VERSION: &str = "erosion-v2";
+pub const METRIC_VERSION: &str = "erosion-v3";
 pub const COMPLEXITY_THRESHOLD: u64 = 10;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]

@@ -17,10 +17,12 @@ const ANALYZER_SOURCES: &[(&str, &str)] = &[
         "src/languages/javascript.rs",
         include_str!("languages/javascript.rs"),
     ),
+    ("src/languages/gleam.rs", include_str!("languages/gleam.rs")),
     (
         "src/languages/python.rs",
         include_str!("languages/python.rs"),
     ),
+    ("src/languages/rust.rs", include_str!("languages/rust.rs")),
     ("src/languages/tree.rs", include_str!("languages/tree.rs")),
 ];
 
