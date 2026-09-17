@@ -4,6 +4,7 @@ pub mod git;
 pub mod history;
 pub mod languages;
 pub mod metrics;
+pub mod modules;
 pub mod output;
 
 use anyhow::{Context, Result, bail};
@@ -14,7 +15,7 @@ use std::path::Path;
 
 use cache::Cache;
 use config::{Config, Scope};
-use git::{Commit, Repository};
+use git::{BlobReader, Commit, Repository, TreeEntry};
 use history::Checkpoint;
 use languages::{Language, LanguageAdapter};
 use metrics::{COMPLEXITY_THRESHOLD, FunctionMetrics, METRIC_VERSION, ParseDiagnostic, Sum};
@@ -66,6 +67,7 @@ pub enum Status {
     Partial,
     NotMeasurable,
     NoCommit,
+    NoFiles,
 }
 
 impl Status {
@@ -75,6 +77,7 @@ impl Status {
             Self::Partial => "partial",
             Self::NotMeasurable => "not_measurable",
             Self::NoCommit => "no_commit",
+            Self::NoFiles => "no_files",
         }
     }
 }
@@ -118,6 +121,48 @@ impl Snapshot {
     }
 }
 
+struct SnapshotAccumulator {
+    snapshot: Snapshot,
+    total: Sum,
+    complex: Sum,
+}
+
+impl SnapshotAccumulator {
+    fn new(checkpoint: &Checkpoint) -> Self {
+        Self {
+            snapshot: Snapshot::empty(checkpoint),
+            total: Sum::default(),
+            complex: Sum::default(),
+        }
+    }
+
+    fn finish(mut self, top: usize) -> Snapshot {
+        let snapshot = &mut self.snapshot;
+        snapshot.total_mass = self.total.total();
+        snapshot.complex_mass = self.complex.total();
+        snapshot.erosion_pct = (snapshot.total_mass > 0.0)
+            .then(|| 100.0 * snapshot.complex_mass / snapshot.total_mass);
+        if snapshot.commit.is_some() {
+            snapshot.status = if snapshot.coverage.failed_files > 0 {
+                Status::Partial
+            } else if snapshot.erosion_pct.is_none() {
+                Status::NotMeasurable
+            } else {
+                Status::Complete
+            };
+        }
+        snapshot.top_functions.sort_by(|a, b| {
+            b.mass
+                .total_cmp(&a.mass)
+                .then_with(|| a.path.cmp(&b.path))
+                .then(a.function.start_line.cmp(&b.function.start_line))
+                .then(a.function.end_line.cmp(&b.function.end_line))
+        });
+        snapshot.top_functions.truncate(top);
+        self.snapshot
+    }
+}
+
 #[derive(Serialize)]
 pub struct MetricIdentity {
     pub name: &'static str,
@@ -126,6 +171,19 @@ pub struct MetricIdentity {
     pub parser_versions: &'static str,
     pub complexity_threshold: u64,
     pub formula: &'static str,
+}
+
+impl MetricIdentity {
+    fn current() -> Self {
+        Self {
+            name: "erosion",
+            version: METRIC_VERSION,
+            analyzer_fingerprint: cache::analyzer_fingerprint(),
+            parser_versions: languages::PARSER_VERSIONS,
+            complexity_threshold: COMPLEXITY_THRESHOLD,
+            formula: "100 * sum(CC * sqrt(SLOC) where CC > 10) / sum(CC * sqrt(SLOC))",
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -160,119 +218,115 @@ impl Analyzer {
         checkpoint: &Checkpoint,
         top: usize,
     ) -> Result<Snapshot> {
-        let mut snapshot = Snapshot::empty(checkpoint);
+        let mut accumulator = SnapshotAccumulator::new(checkpoint);
         let Some(commit) = &checkpoint.commit else {
-            return Ok(snapshot);
+            return Ok(accumulator.finish(top));
         };
         let entries = repo.entries(&commit.sha)?;
-        snapshot.coverage.tracked_entries = entries.len();
         let mut reader = repo.blobs()?;
-        let mut total = Sum::default();
-        let mut complex = Sum::default();
         for entry in entries {
             if !scope.contains(&entry.path) {
-                snapshot.coverage.excluded_entries += 1;
+                accumulator.snapshot.coverage.tracked_entries += 1;
+                accumulator.snapshot.coverage.excluded_entries += 1;
                 continue;
             }
-            if !entry.is_regular() {
-                snapshot.coverage.non_regular_entries += 1;
-                continue;
-            }
-            let Some(language) = Language::for_path(&entry.path) else {
-                snapshot.coverage.unsupported_files += 1;
-                let extension = Path::new(&entry.path)
-                    .extension()
-                    .and_then(|value| value.to_str())
-                    .unwrap_or("<none>")
-                    .to_ascii_lowercase();
-                *snapshot
-                    .coverage
-                    .unsupported_extensions
-                    .entry(extension)
-                    .or_default() += 1;
-                continue;
-            };
-            snapshot.coverage.selected_files += 1;
-            let language_coverage = snapshot
+            self.accumulate_entry(&mut accumulator, entry, &mut reader, top)?;
+        }
+        Ok(accumulator.finish(top))
+    }
+
+    fn accumulate_entry(
+        &mut self,
+        accumulator: &mut SnapshotAccumulator,
+        entry: TreeEntry,
+        reader: &mut BlobReader,
+        top: usize,
+    ) -> Result<()> {
+        let snapshot = &mut accumulator.snapshot;
+        snapshot.coverage.tracked_entries += 1;
+        if !entry.is_regular() {
+            snapshot.coverage.non_regular_entries += 1;
+            return Ok(());
+        }
+        let Some(language) = Language::for_path(&entry.path) else {
+            snapshot.coverage.unsupported_files += 1;
+            let extension = Path::new(&entry.path)
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or("<none>")
+                .to_ascii_lowercase();
+            *snapshot
                 .coverage
-                .languages
-                .entry(language.id().to_owned())
-                .or_default();
-            language_coverage.selected_files += 1;
-            let analysis = match self.cache.get(language, &entry.oid)? {
-                Some(cached) => cached,
-                None => {
-                    let source = reader
-                        .read(&entry.oid)
-                        .with_context(|| format!("Reading {:?} at {}", entry.path, commit.sha))?;
-                    if let std::collections::hash_map::Entry::Vacant(slot) =
-                        self.adapters.entry(language)
-                    {
-                        slot.insert(languages::adapter(language)?);
-                    }
-                    let parsed = self
-                        .adapters
-                        .get_mut(&language)
-                        .context("Missing language adapter")?
-                        .analyze(&source)
-                        .with_context(|| format!("Analyzing {:?}", entry.path))?;
-                    self.cache.insert(language, &entry.oid, parsed)?
+                .unsupported_extensions
+                .entry(extension)
+                .or_default() += 1;
+            return Ok(());
+        };
+        snapshot.coverage.selected_files += 1;
+        let language_coverage = snapshot
+            .coverage
+            .languages
+            .entry(language.id().to_owned())
+            .or_default();
+        language_coverage.selected_files += 1;
+        let analysis = match self.cache.get(language, &entry.oid)? {
+            Some(cached) => cached,
+            None => {
+                let commit = snapshot
+                    .commit
+                    .as_ref()
+                    .context("Missing snapshot commit")?;
+                let source = reader
+                    .read(&entry.oid)
+                    .with_context(|| format!("Reading {:?} at {}", entry.path, commit.sha))?;
+                if let std::collections::hash_map::Entry::Vacant(slot) =
+                    self.adapters.entry(language)
+                {
+                    slot.insert(languages::adapter(language)?);
                 }
-            };
-            if !analysis.parsed() {
-                snapshot.coverage.failed_files += 1;
-                snapshot.coverage.failed_physical_lines += analysis.physical_lines;
-                language_coverage.failed_files += 1;
-                snapshot.failures.push(FailedFile {
-                    path: entry.path,
-                    language,
-                    physical_lines: analysis.physical_lines,
-                    diagnostics: analysis.diagnostics.clone(),
-                });
-                continue;
+                let parsed = self
+                    .adapters
+                    .get_mut(&language)
+                    .context("Missing language adapter")?
+                    .analyze(&source)
+                    .with_context(|| format!("Analyzing {:?}", entry.path))?;
+                self.cache.insert(language, &entry.oid, parsed)?
             }
-            snapshot.coverage.parsed_files += 1;
-            snapshot.coverage.parsed_physical_lines += analysis.physical_lines;
-            snapshot.coverage.parsed_source_lines += analysis.source_lines;
-            language_coverage.parsed_files += 1;
-            for function in &analysis.functions {
-                snapshot.functions += 1;
-                let mass = function.mass();
-                total.add(mass);
-                if function.complexity > COMPLEXITY_THRESHOLD {
-                    snapshot.complex_functions += 1;
-                    complex.add(mass);
-                    if top != 0 {
-                        snapshot.top_functions.push(TopFunction {
-                            path: entry.path.clone(),
-                            language,
-                            function: function.clone(),
-                            mass,
-                        });
-                    }
+        };
+        if !analysis.parsed() {
+            snapshot.coverage.failed_files += 1;
+            snapshot.coverage.failed_physical_lines += analysis.physical_lines;
+            language_coverage.failed_files += 1;
+            snapshot.failures.push(FailedFile {
+                path: entry.path,
+                language,
+                physical_lines: analysis.physical_lines,
+                diagnostics: analysis.diagnostics.clone(),
+            });
+            return Ok(());
+        }
+        snapshot.coverage.parsed_files += 1;
+        snapshot.coverage.parsed_physical_lines += analysis.physical_lines;
+        snapshot.coverage.parsed_source_lines += analysis.source_lines;
+        language_coverage.parsed_files += 1;
+        for function in &analysis.functions {
+            snapshot.functions += 1;
+            let mass = function.mass();
+            accumulator.total.add(mass);
+            if function.complexity > COMPLEXITY_THRESHOLD {
+                snapshot.complex_functions += 1;
+                accumulator.complex.add(mass);
+                if top != 0 {
+                    snapshot.top_functions.push(TopFunction {
+                        path: entry.path.clone(),
+                        language,
+                        function: function.clone(),
+                        mass,
+                    });
                 }
             }
         }
-        snapshot.total_mass = total.total();
-        snapshot.complex_mass = complex.total();
-        snapshot.erosion_pct = (snapshot.total_mass > 0.0)
-            .then(|| 100.0 * snapshot.complex_mass / snapshot.total_mass);
-        snapshot.status = if snapshot.coverage.failed_files > 0 {
-            Status::Partial
-        } else if snapshot.erosion_pct.is_none() {
-            Status::NotMeasurable
-        } else {
-            Status::Complete
-        };
-        snapshot.top_functions.sort_by(|a, b| {
-            b.mass
-                .total_cmp(&a.mass)
-                .then_with(|| a.path.cmp(&b.path))
-                .then(a.function.start_line.cmp(&b.function.start_line))
-                .then(a.function.end_line.cmp(&b.function.end_line))
-        });
-        snapshot.top_functions.truncate(top);
-        Ok(snapshot)
+        Ok(())
     }
 
     pub fn report(
@@ -300,14 +354,7 @@ impl Analyzer {
             tool_version: env!("CARGO_PKG_VERSION"),
             mode,
             reference,
-            metric: MetricIdentity {
-                name: "erosion",
-                version: METRIC_VERSION,
-                analyzer_fingerprint: cache::analyzer_fingerprint(),
-                parser_versions: languages::PARSER_VERSIONS,
-                complexity_threshold: COMPLEXITY_THRESHOLD,
-                formula: "100 * sum(CC * sqrt(SLOC) where CC > 10) / sum(CC * sqrt(SLOC))",
-            },
+            metric: MetricIdentity::current(),
             scope: scope.config.clone(),
             scope_fingerprint: scope.fingerprint.clone(),
             snapshots,
@@ -316,8 +363,15 @@ impl Analyzer {
 }
 
 pub fn require_complete(report: &Report, allow_partial: bool) -> Result<()> {
+    require_complete_snapshots(report.snapshots.iter(), allow_partial)
+}
+
+fn require_complete_snapshots<'a>(
+    snapshots: impl Iterator<Item = &'a Snapshot>,
+    allow_partial: bool,
+) -> Result<()> {
     let mut failed = 0;
-    for snapshot in &report.snapshots {
+    for snapshot in snapshots {
         for file in &snapshot.failures {
             failed += 1;
             eprintln!(

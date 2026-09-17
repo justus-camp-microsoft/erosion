@@ -27,6 +27,8 @@ server, plugin loader, AST-Grep dependency, or project-code execution.
   persistent records outside the measured worktree.
 - `lib.rs`: per-checkpoint aggregation, coverage accounting, partial-result
   policy, top contributing functions, and versioned report records.
+- `modules.rs`: historical module discovery, module-path selection, and
+  whole-module series built with the shared snapshot accumulator.
 - `output.rs`: table, JSON, and single-table CSV serialization.
 
 ## Metric invariants
@@ -109,6 +111,47 @@ TO minus FROM. Both sides share the frozen scope and blob cache; an absent
 score on either side makes the difference unmeasurable. Parse-failure diagnostics
 include commit identity so failures remain distinguishable even at equal timestamps.
 
+## Whole-module history
+
+`modules` uses the same first-parent checkpoints as `history`. Modules are
+directories exactly `--depth` levels below the repository root (default 1).
+Their keys are the first N directory components of tracked entry paths, never
+filenames. Discovery uses every sampled commit, including unsupported files and
+modules deleted before the reference commit. A file becoming a directory creates
+a module only when tracked descendants establish that directory at the requested
+depth; a directory replaced by a file becomes absent. Shallow paths never
+collapse deeper modules.
+
+Each checkpoint's repository inventory partitions all tracked entries into those
+above the requested directory depth, those in unselected modules, and those in
+selected modules. Entries outside the depth are counted explicitly but not parsed,
+even when their full filenames match a glob. Selecting a parent at a shallower
+depth includes its loose files; repository-root files can be measured with
+`measure`. Gitlinks and symlinks do not establish module directories, but remain
+counted non-regular entries when beneath a selected directory.
+
+Repeated `--glob` options select the union of matching discovered module keys.
+`*` does not cross `/`; `**` can. They never filter files within selected modules.
+All tracked descendants of selected module paths are inventoried; all supported
+regular source files are analyzed, including tests and generated code.
+Unsupported files and non-regular entries remain visible in coverage. Links
+and submodules are not followed. `modules` does not accept `--config` and never
+loads `erosion.toml`, even when that file contains invalid or excluding rules.
+Unmatched selections fail explicitly without emitting an empty result.
+
+Discovery inspects tree inventories, not source bodies. Analysis then streams
+each checkpoint once for all selected modules and reuses the existing blob cache.
+Module keys, depth, and filters never enter language adapters or cached analyses.
+The shared accumulator combines function masses and coverage identically for
+repository-wide and module reports.
+
+A module's missing checkpoint has `no_files`, a null score, and zero tracked
+entries. A present module with only unsupported files or no function mass is
+`not_measurable`, not absent. `no_commit` remains distinct. Changes compare only
+adjacent measurable checkpoints; births, deletions, and gaps never become zero
+scores or changes across missing data. Renames are separate paths, not tracked
+identities. Strict/partial failure policy is identical to other commands.
+
 ## Results and persistence
 
 Each result includes full commit identity/timestamp, requested cutoff,
@@ -117,6 +160,8 @@ JSON is the full structured contract; CSV encodes nested diagnostics and
 coverage as JSON-valued columns. Human output leads with the score or delta and
 compact coverage; fingerprints, raw coverage maps and full provenance remain
 in JSON/CSV. Table output is presentation, not a stable machine-readable schema.
+Module tables contain only measurement rows. Repository inventory counts remain
+in JSON/CSV; usage explanations belong in command help, not a report footer.
 The CLI emits processing/cache diagnostics on stderr only with `--verbose`;
 the analyzer's report loop is quiet. Verbosity never changes serialized results.
 
@@ -140,3 +185,13 @@ repository data. Report schema and cache schema are versioned separately.
 Delta uses report schema 1 with the additional `mode` value `delta`; its ordered
 snapshots and CSV rows reuse existing fields. Metric identity and cache schema
 are unchanged.
+
+Module reports use their own schema-2 `mode: "modules"` shape with grouping
+parameters/fingerprint (including `kind: "directories"`),
+`file_scope: "all_tracked_entries"`, the discovered module count, repository
+inventory per checkpoint, and path-sorted module series containing checkpoint
+snapshots. JSON retains per-module coverage and failures; CSV has one row per
+module/checkpoint with the corresponding repository inventory counts. Directory
+grouping identity is distinct from file-leaf grouping; those module reports
+must not be compared as if their scopes were identical.
+Existing command report shapes, metric rules, and cache records are unchanged.

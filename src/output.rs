@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 use std::fmt::Write;
 
-use crate::{Report, Snapshot, Status};
+use crate::{Report, Snapshot, Status, modules::ModuleReport};
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum Format {
@@ -21,6 +21,36 @@ pub fn render(report: &Report, format: Format) -> Result<Vec<u8>> {
         Format::Csv => csv(report),
         Format::Table => table(report),
     }
+}
+
+pub fn render_modules(report: &ModuleReport, format: Format) -> Result<Vec<u8>> {
+    match format {
+        Format::Json => {
+            let mut output = serde_json::to_vec_pretty(report)?;
+            output.push(b'\n');
+            Ok(output)
+        }
+        Format::Csv => modules_csv(report),
+        Format::Table => modules_table(report),
+    }
+}
+
+fn modules_table(report: &ModuleReport) -> Result<Vec<u8>> {
+    let mut text = String::new();
+    writeln!(text, "Erosion whole-module history\n")?;
+    for module in &report.modules {
+        writeln!(text, "Module: {}", module.path.escape_debug())?;
+        header(&mut text, "Checkpoint")?;
+        for snapshot in &module.snapshots {
+            row(
+                &mut text,
+                &snapshot.cutoff_utc.format("%Y-%m-%d").to_string(),
+                snapshot,
+            )?;
+        }
+        writeln!(text)?;
+    }
+    Ok(text.into_bytes())
 }
 
 fn table(report: &Report) -> Result<Vec<u8>> {
@@ -168,6 +198,7 @@ fn row(text: &mut String, label: &str, snapshot: &Snapshot) -> Result<()> {
         Status::Partial => "partial",
         Status::NotMeasurable => "not measurable",
         Status::NoCommit => "no commit",
+        Status::NoFiles => "no files",
     };
     let coverage = &snapshot.coverage;
     let skipped =
@@ -340,6 +371,124 @@ fn csv(report: &Report) -> Result<Vec<u8>> {
             serde_json::to_string(&coverage.unsupported_extensions)?,
             serde_json::to_string(&snapshot.failures)?,
         ])?;
+    }
+    writer.flush()?;
+    Ok(writer.into_inner()?)
+}
+
+fn modules_csv(report: &ModuleReport) -> Result<Vec<u8>> {
+    let mut writer = csv::Writer::from_writer(Vec::new());
+    writer.write_record([
+        "schema_version",
+        "tool_version",
+        "mode",
+        "metric_version",
+        "analyzer_fingerprint",
+        "parser_versions",
+        "metric_json",
+        "grouping_fingerprint",
+        "grouping_json",
+        "file_scope",
+        "discovered_modules",
+        "reference_sha",
+        "reference_committed_at",
+        "reference_json",
+        "module",
+        "cutoff_utc",
+        "commit",
+        "committed_at",
+        "status",
+        "tracked_entries",
+        "selected_files",
+        "parsed_files",
+        "failed_files",
+        "unsupported_files",
+        "excluded_entries",
+        "non_regular_entries",
+        "parsed_physical_lines",
+        "failed_physical_lines",
+        "parsed_source_lines",
+        "coverage_json",
+        "repository_tracked_entries",
+        "outside_depth_entries",
+        "unselected_module_entries",
+        "selected_module_entries",
+        "functions",
+        "complex_functions",
+        "total_mass",
+        "complex_mass",
+        "erosion_pct",
+        "change_pp",
+        "failures_json",
+    ])?;
+    let metric_json = serde_json::to_string(&report.metric)?;
+    let grouping_json = serde_json::to_string(&report.grouping)?;
+    let reference_json = serde_json::to_string(&report.reference)?;
+    for module in &report.modules {
+        for (index, snapshot) in module.snapshots.iter().enumerate() {
+            let inventory = report
+                .inventory
+                .get(index)
+                .context("Missing module inventory checkpoint")?;
+            let coverage = &snapshot.coverage;
+            writer.write_record([
+                report.schema_version.to_string(),
+                report.tool_version.to_owned(),
+                report.mode.to_owned(),
+                report.metric.version.to_owned(),
+                report.metric.analyzer_fingerprint.clone(),
+                report.metric.parser_versions.to_owned(),
+                metric_json.clone(),
+                report.grouping_fingerprint.clone(),
+                grouping_json.clone(),
+                report.file_scope.to_owned(),
+                report.discovered_modules.to_string(),
+                report.reference.sha.clone(),
+                report.reference.committed_at.to_rfc3339(),
+                reference_json.clone(),
+                module.path.clone(),
+                snapshot.cutoff_utc.to_rfc3339(),
+                snapshot
+                    .commit
+                    .as_ref()
+                    .map(|commit| commit.sha.clone())
+                    .unwrap_or_default(),
+                snapshot
+                    .commit
+                    .as_ref()
+                    .map(|commit| commit.committed_at.to_rfc3339())
+                    .unwrap_or_default(),
+                snapshot.status.id().to_owned(),
+                coverage.tracked_entries.to_string(),
+                coverage.selected_files.to_string(),
+                coverage.parsed_files.to_string(),
+                coverage.failed_files.to_string(),
+                coverage.unsupported_files.to_string(),
+                coverage.excluded_entries.to_string(),
+                coverage.non_regular_entries.to_string(),
+                coverage.parsed_physical_lines.to_string(),
+                coverage.failed_physical_lines.to_string(),
+                coverage.parsed_source_lines.to_string(),
+                serde_json::to_string(coverage)?,
+                inventory.tracked_entries.to_string(),
+                inventory.outside_depth_entries.to_string(),
+                inventory.unselected_module_entries.to_string(),
+                inventory.selected_module_entries.to_string(),
+                snapshot.functions.to_string(),
+                snapshot.complex_functions.to_string(),
+                snapshot.total_mass.to_string(),
+                snapshot.complex_mass.to_string(),
+                snapshot
+                    .erosion_pct
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                snapshot
+                    .change_pp
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                serde_json::to_string(&snapshot.failures)?,
+            ])?;
+        }
     }
     writer.flush()?;
     Ok(writer.into_inner()?)

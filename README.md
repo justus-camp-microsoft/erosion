@@ -39,6 +39,7 @@ Usage: erosion <COMMAND>
 Commands:
   measure  Measure committed HEAD or a selected revision
   history  Measure first-parent history at UTC calendar checkpoints
+  modules  Measure whole-module history by selecting discovered module paths
   delta    Compare two committed snapshots: erosion at TO minus erosion at FROM
   help     Print this message or the help of the given subcommand(s)
 
