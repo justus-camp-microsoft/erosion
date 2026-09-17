@@ -9,7 +9,7 @@ use std::path::Path;
 use crate::metrics::FileAnalysis;
 
 pub const PARSER_VERSIONS: &str =
-    "tree-sitter=0.25.2;javascript=0.25.0;typescript=0.23.2;python=0.25.0";
+    "tree-sitter=0.25.2;javascript=0.25.0;typescript=0.23.2-erosion.1;python=0.25.0";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]

@@ -28,6 +28,7 @@ pub fn analyzer_fingerprint() -> String {
     let mut hash = Sha256::new();
     hash.update(METRIC_VERSION);
     hash.update(PARSER_VERSIONS);
+    hash.update(tree_sitter_typescript::SOURCE_FINGERPRINT);
     hash.update(CACHE_SCHEMA.to_le_bytes());
     for (path, source) in ANALYZER_SOURCES {
         hash.update(path.as_bytes());
@@ -273,6 +274,39 @@ mod tests {
     }
 
     #[test]
+    fn typescript_patch_matches_the_locked_git_revision() {
+        let manifest: toml::Value = toml::from_str(include_str!("../Cargo.toml")).unwrap();
+        let patch = &manifest["patch"]["crates-io"]["tree-sitter-typescript"];
+        let git = patch["git"].as_str().unwrap();
+        let revision = patch["rev"].as_str().unwrap();
+        assert_eq!(
+            git,
+            "https://github.com/justus-camp-microsoft/tree-sitter-typescript"
+        );
+        assert_eq!(revision.len(), 40);
+        assert!(
+            revision
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        );
+        for moving_or_local_source in ["branch", "tag", "path"] {
+            assert!(patch.get(moving_or_local_source).is_none());
+        }
+        let lock: toml::Value = toml::from_str(include_str!("../Cargo.lock")).unwrap();
+        let packages: Vec<_> = lock["package"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|package| package["name"].as_str() == Some("tree-sitter-typescript"))
+            .collect();
+        assert_eq!(packages.len(), 1);
+        assert_eq!(
+            packages[0]["source"].as_str().unwrap(),
+            format!("git+{git}?rev={revision}#{revision}")
+        );
+    }
+
+    #[test]
     fn fingerprint_covers_analyzer_sources_and_pinned_grammars() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut expected = vec!["src/metrics.rs".to_owned()];
@@ -303,7 +337,7 @@ mod tests {
         for (name, version) in [
             ("tree-sitter", "0.25.2"),
             ("tree-sitter-javascript", "0.25.0"),
-            ("tree-sitter-typescript", "0.23.2"),
+            ("tree-sitter-typescript", "0.23.2-erosion.1"),
             ("tree-sitter-python", "0.25.0"),
         ] {
             let packages = lock["package"].as_array().unwrap();
@@ -311,5 +345,11 @@ mod tests {
                 |p| p["name"].as_str() == Some(name) && p["version"].as_str() == Some(version)
             ));
         }
+        assert_eq!(tree_sitter_typescript::SOURCE_FINGERPRINT.len(), 64);
+        assert!(
+            tree_sitter_typescript::SOURCE_FINGERPRINT
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        );
     }
 }
