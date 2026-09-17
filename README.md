@@ -32,12 +32,6 @@ installation is needed at runtime.
 - Rust: `.rs`
 - Gleam: `.gleam`
 
-Cyclomatic complexity counts language control-flow branches and short-circuit
-boolean operators. Rust includes functions, closures, loops, `if`, non-wildcard
-`match` arms, and `let ... else`. Gleam includes functions, anonymous functions,
-non-catch-all `case` clauses, guards, and assertions. Comments do not count as
-source lines.
-
 ## Usage
 ```
 Usage: erosion <COMMAND>

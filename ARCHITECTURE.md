@@ -42,11 +42,26 @@ The analyzer walks syntax trees iteratively. SLOC uses LF-aligned file-level
 source-line membership intersected with each callable's inclusive line span.
 Comment-only, blank, and punctuation-only lines do not contribute. Python also
 excludes scope-leading ordinary string expressions as docstrings, but retains
-data strings. Language-specific rules are documented in README.md; cross-language
-aggregation sums mass rather than averaging percentages.
+data strings. Cross-language aggregation sums mass rather than averaging percentages.
+
+Rust includes functions and closures; decisions include loops, `if`, non-wildcard
+`match` arms, `let ... else`, and short-circuit boolean operators. Gleam includes
+functions and anonymous functions; decisions include non-catch-all `case` clauses,
+guarded clauses, assertions, and short-circuit boolean operators. Comments do not
+count as source lines.
 
 Parser versions are pinned. The analyzer identity covers measurement source,
-language routing, parser versions, metric version, and cache schema. Changing
+language routing, parser versions, metric version, and cache schema. TypeScript/TSX
+come from the `justus-camp-microsoft/tree-sitter-typescript` fork through a
+`[patch.crates-io]` override pinned to a full Git revision, also recorded in
+`Cargo.lock`. Cargo retrieves the dependency at build time; the CLI never downloads
+parsers at runtime. There is no local vendored copy or dependency on a sibling checkout.
+The fork crate also hashes its grammar inputs, generated parsers, scanners,
+headers, bindings, and build inputs at build time. Only the resulting digest enters
+the analyzer fingerprint, not an extra copy of the generated C in the executable.
+Both dialects are regenerated together from pinned tooling; provenance and commands
+live in the fork's `EROSION.md`. Compatibility fixes must preserve
+strict diagnostics rather than rewriting source or ignoring error nodes. Changing
 counting behavior must preserve cache invalidation and update the documented
 metric contract/version when semantics change.
 

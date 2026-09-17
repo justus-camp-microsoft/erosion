@@ -116,7 +116,11 @@ mod tests {
             .unwrap()
             .analyze(source.as_bytes())
             .unwrap();
-        assert!(result.parsed(), "{:?}", result.diagnostics);
+        assert!(
+            result.parsed(),
+            "{language:?}: {source}\n{:?}",
+            result.diagnostics
+        );
         result
     }
 
@@ -218,6 +222,153 @@ mod tests {
             let result = adapter.analyze(source).unwrap();
             assert!(!result.parsed());
             assert!(result.functions.is_empty());
+        }
+    }
+
+    #[test]
+    fn typescript_variance_modifiers_are_type_syntax_not_functions() {
+        let source = "\
+export declare class Producer<out T> { protected constructor(); readonly value: T; }\n\
+export interface Consumer<in T> { consume(value: T): void; }\n\
+export interface Cell<in out T> { get(): T; set(value: T): void; }\n\
+export type Reader<out T> = () => T;\n\
+export type Writer<in T> = (value: T) => void;\n\
+export interface Options<\n\
+  out T extends string = string,\n\
+  in out U extends unknown[] = [],\n\
+> { readonly value: T; update(value: U): U; }\n";
+        for language in [Language::TypeScript, Language::Tsx] {
+            let file = parse(source, language);
+            assert!(file.functions.is_empty());
+            assert_eq!(file.source_lines, 9);
+        }
+    }
+
+    #[test]
+    fn typescript_type_only_star_exports() {
+        for language in [Language::TypeScript, Language::Tsx] {
+            let file = parse(
+                "export type * from './types';\nexport type * as api from './types';\nexport type { Item } from './types';\n",
+                language,
+            );
+            assert!(file.functions.is_empty());
+            assert_eq!(file.source_lines, 3);
+        }
+    }
+
+    #[test]
+    fn typescript_out_remains_a_contextual_type_parameter_name() {
+        let source = "\
+interface A<out> { value: string; }\n\
+interface Pair<T, out> { first: T; second: out; }\n\
+class Q<out> extends Array<out> {}\n\
+function identity<out>(value: out): out { return value; }\n\
+type Defaulted<out = string> = out;\n\
+interface Covariant<out out> { readonly value: out; }\n";
+        for language in [Language::TypeScript, Language::Tsx] {
+            let file = parse(source, language);
+            assert_eq!(file.source_lines, 6);
+            assert_eq!(file.functions.len(), 1);
+            assert_eq!(file.functions[0].complexity, 1);
+            assert_eq!(file.functions[0].source_lines, 1);
+        }
+    }
+
+    #[test]
+    fn typescript_negative_comparison_in_arrow_call_arguments() {
+        for language in [Language::TypeScript, Language::Tsx] {
+            for expression in ["item.value < -1", "item.value < +1", "item.value < 1"] {
+                for suffix in [");", ",);", ", other);"] {
+                    let source = format!(
+                        "const filtered = items.filter((item: Item) => {expression}{suffix}\n"
+                    );
+                    let file = parse(&source, language);
+                    assert_eq!(file.functions.len(), 1);
+                    assert_eq!(file.functions[0].complexity, 1);
+                    assert_eq!(file.functions[0].source_lines, 1);
+                    let mut adapter = JavaScriptAdapter::new(language).unwrap();
+                    let tree = adapter.parser.parse(&source, None).unwrap();
+                    let mut stack = vec![tree.root_node()];
+                    let mut arrows = 0;
+                    while let Some(node) = stack.pop() {
+                        if node.kind() == "arrow_function" {
+                            let body = node.child_by_field_name("body").unwrap();
+                            assert_eq!(body.kind(), "binary_expression");
+                            assert_eq!(
+                                body.child_by_field_name("right").unwrap().kind(),
+                                if expression == "item.value < 1" {
+                                    "number"
+                                } else {
+                                    "unary_expression"
+                                }
+                            );
+                            arrows += 1;
+                        }
+                        let mut cursor = node.walk();
+                        stack.extend(node.named_children(&mut cursor));
+                    }
+                    assert_eq!(arrows, 1);
+                }
+            }
+            let source = "type Negative = -1;\ntype Boxed = Box<-1,>;\nf<-1>();\nf<-1,>();\nconst specialized = f<-1>;\nf(x < -1,);\n";
+            let file = parse(source, language);
+            assert!(file.functions.is_empty());
+            assert_eq!(file.source_lines, 6);
+            let mut adapter = JavaScriptAdapter::new(language).unwrap();
+            let tree = adapter.parser.parse(source, None).unwrap();
+            let mut stack = vec![tree.root_node()];
+            let mut kinds = Vec::new();
+            while let Some(node) = stack.pop() {
+                kinds.push(node.kind());
+                let mut cursor = node.walk();
+                stack.extend(node.named_children(&mut cursor));
+            }
+            for (kind, count) in [
+                ("type_arguments", 4),
+                ("instantiation_expression", 1),
+                ("binary_expression", 1),
+            ] {
+                assert_eq!(kinds.iter().filter(|&&found| found == kind).count(), count);
+            }
+        }
+    }
+
+    #[test]
+    fn typescript_contextual_keywords_as_parameter_names() {
+        for language in [Language::TypeScript, Language::Tsx] {
+            let file = parse(
+                "type Callback = (any) => any;\ninterface Events { readonly handler: (readonly?: boolean, reason?: string) => void; }\n",
+                language,
+            );
+            assert!(file.functions.is_empty());
+            assert_eq!(file.source_lines, 2);
+            for keyword in [
+                "any", "readonly", "number", "boolean", "string", "symbol", "object", "unknown",
+                "never",
+            ] {
+                assert!(
+                    parse(&format!("type Callback = ({keyword}) => any;\n"), language)
+                        .functions
+                        .is_empty()
+                );
+            }
+            assert!(
+                parse(
+                    "type A = (any);\ntype B = readonly number[];\ntype C = (readonly number[]);\n",
+                    language
+                )
+                .functions
+                .is_empty()
+            );
+            assert_eq!(
+                parse(
+                    "class C { constructor(readonly value: string) {} }\n",
+                    language
+                )
+                .functions
+                .len(),
+                1
+            );
         }
     }
 }

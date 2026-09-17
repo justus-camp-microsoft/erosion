@@ -21,6 +21,9 @@ mod rust_gleam;
 #[path = "cases/output.rs"]
 mod output;
 
+#[path = "cases/typescript.rs"]
+mod typescript;
+
 fn git(root: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .arg("-C")

@@ -22,7 +22,10 @@ tree-sitter-gleam = { git = "https://github.com/gleam-lang/tree-sitter-gleam", r
 tree-sitter-javascript = "=0.25.0"
 tree-sitter-python = "=0.25.0"
 tree-sitter-rust = "=0.24.2"
-tree-sitter-typescript = "=0.23.2"
+tree-sitter-typescript = "=0.23.2-erosion.1"
+
+[patch.crates-io]
+tree-sitter-typescript = { git = "https://github.com/justus-camp-microsoft/tree-sitter-typescript", rev = "2c098a674635c51f90fc1aef3ce26a6acab46721" }
 
 [lints.clippy]
 all = "warn"
