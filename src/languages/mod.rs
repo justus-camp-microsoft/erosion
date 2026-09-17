@@ -59,9 +59,56 @@ pub trait LanguageAdapter {
 
 pub fn adapter(language: Language) -> Result<Box<dyn LanguageAdapter>> {
     match language {
+        Language::JavaScript | Language::TypeScript | Language::Tsx => {
+            Ok(Box::new(javascript::JavaScriptAdapter::new(language)?))
+        }
         Language::Python => Ok(Box::new(python::PythonAdapter::new()?)),
         Language::Rust => Ok(Box::new(rust::RustAdapter::new()?)),
         Language::Gleam => Ok(Box::new(gleam::GleamAdapter::new()?)),
-        _ => Ok(Box::new(javascript::JavaScriptAdapter::new(language)?)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn factory_routes_each_language_to_its_grammar() {
+        for (language, source) in [
+            (Language::JavaScript, "const view = () => <div />;"),
+            (
+                Language::TypeScript,
+                "const value = (x: number): number => x;",
+            ),
+            (Language::Tsx, "const view = (x: string) => <div>{x}</div>;"),
+            (Language::Python, "def value(x):\n    return x\n"),
+            (Language::Rust, "fn value(x: i32) -> i32 { x }"),
+            (Language::Gleam, "pub fn value(x: Int) -> Int { x }"),
+        ] {
+            let analysis = adapter(language)
+                .unwrap()
+                .analyze(source.as_bytes())
+                .unwrap();
+            assert!(
+                analysis.parsed(),
+                "{language:?}: {:?}",
+                analysis.diagnostics
+            );
+            assert_eq!(analysis.functions.len(), 1, "{language:?}");
+            assert_eq!(analysis.functions[0].complexity, 1, "{language:?}");
+        }
+    }
+
+    #[test]
+    fn javascript_adapter_rejects_other_languages() {
+        for language in [Language::Python, Language::Rust, Language::Gleam] {
+            let error = javascript::JavaScriptAdapter::new(language)
+                .err()
+                .expect("Non-JavaScript languages must be rejected");
+            assert_eq!(
+                error.to_string(),
+                format!("JavaScript adapter does not support {}", language.id())
+            );
+        }
     }
 }

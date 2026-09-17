@@ -18,6 +18,9 @@ server, plugin loader, AST-Grep dependency, or project-code execution.
   decision, naming, ignored-source, and grammar-validation rules.
   `languages/tree.rs` owns their shared traversal,
   diagnostics, nested-decision aggregation, and source-line accounting.
+  The central adapter factory routes every `Language` variant explicitly.
+  Family adapters accept only their supported languages and reject all others
+  generically, so new languages do not require edits to unrelated adapters.
 - `metrics.rs`: language-independent measurement records, complexity threshold,
   function mass, and compensated summation.
 - `cache.rs`: path-independent analysis reuse by blob and grammar, with atomic
