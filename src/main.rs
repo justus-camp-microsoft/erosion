@@ -73,7 +73,9 @@ Entries above the requested directory depth are not analyzed; repository-wide
 inventory counts in JSON/CSV report them separately from entries in unselected modules.
 Use a shallower depth to include their parent, or measure for repository-root files.
 
-All tracked descendants are included, with no implicit test/generated exclusions.
+All tracked descendants are inventoried, with no implicit test/generated exclusions.
+--exclude-tests applies language-owned path and syntax detection after module selection;
+--glob remains module-only. Test-only modules stay present with unavailable scores.
 erosion.toml is ignored; scope configuration is not accepted. Unsupported files
 count in coverage; symlinks and submodules are counted but never followed.
 
@@ -126,6 +128,46 @@ struct Shared {
     /// Show processing and cache diagnostics on stderr.
     #[arg(short, long)]
     verbose: bool,
+    /// Exclude language-detected test files and inline tests; included by default.
+    #[arg(
+        long,
+        long_help = "\
+Exclude test source using the language-tests-v1 policy. Each language owns its
+case-sensitive test paths and syntax rules; disabled by default.
+
+JavaScript/TypeScript/TSX: test/tests/__tests__/__mocks__ directories and
+*.test.*, *.tests.*, *.spec.*, *.cy.*;
+bound Node test, Jest, Vitest, Mocha, AVA, Tape, Playwright and uvu APIs;
+unshadowed ambient suites with test callbacks; test-only local helpers.
+Python: test/tests/__tests__ directories; test_*.py, *_test.py and conftest.py
+(also pyw/pyi); unittest TestCase/IsolatedAsyncioTestCase subclasses and main;
+bound pytest fixtures and marked test_* functions/Test* classes.
+Rust: tests directories and tests.rs files; built-in test attributes and known
+tokio/async-std/rstest/test-case attributes; syntax provably gated by cfg(test),
+including inline modules. Ambiguous conditional compilation remains included.
+Gleam: test/tests directories and *_test.gleam; public zero-argument *_test
+functions/EUnit *_test_ generators; unshadowed zero-argument gleeunit.main().
+
+Inline detection preserves production code in mixed files and removes test
+decisions/source lines from enclosing functions, not just test function rows.
+Bindings, aliases and supported static syntax are inspected, never executed.
+Uncertain dynamic/custom framework code remains included. Assertions alone are
+not tests; benchmarks, generated code and bundles have no separate exclusion.
+
+Scope/module selection happens first; --glob selects module paths, never files.
+Only supported regular source files receive language path classification.
+Matching test source files are counted but skipped before reading/parsing.
+Unsupported assets and links/submodules remain in their normal coverage
+categories; links/submodules are never followed. Mixed files must parse fully,
+even when apparent test syntax contains an error.
+
+JSON/CSV records per-language policies, whole-file exclusion counts and separate
+syntax-removal counts. Removed function/source-line counts cover syntax filtering
+only; skipped whole files are not parsed to count their contents. Module
+discovery/inventory is unchanged and test-only modules stay present with null
+scores. The raw default measurement is unchanged."
+    )]
+    exclude_tests: bool,
     /// Emit explicitly incomplete results when files fail to parse.
     #[arg(
         long,
@@ -219,6 +261,9 @@ fn run(cli: Cli) -> Result<()> {
         common.no_cache,
         &repo.root,
     )?);
+    if common.exclude_tests {
+        analyzer = analyzer.exclude_tests()?;
+    }
     if common.verbose {
         eprintln!("Processing {} snapshot(s)...", checkpoints.len());
     }

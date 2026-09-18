@@ -6,11 +6,12 @@ mod tree;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::metrics::FileAnalysis;
 
-pub const PARSER_VERSIONS: &str = "tree-sitter=0.25.2;javascript=0.25.0;typescript=0.23.2-erosion.1;python=0.25.0;rust=0.24.2;gleam=git-cefbd686";
+pub const PARSER_VERSIONS: &str = "tree-sitter=0.25.2;javascript=0.25.0;typescript=0.23.2-erosion.2;python=0.25.0;rust=0.24.2-erosion.1;gleam=git-cefbd686";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -24,6 +25,15 @@ pub enum Language {
 }
 
 impl Language {
+    pub const ALL: [Self; 6] = [
+        Self::JavaScript,
+        Self::TypeScript,
+        Self::Tsx,
+        Self::Python,
+        Self::Rust,
+        Self::Gleam,
+    ];
+
     pub fn for_path(path: &str) -> Option<Self> {
         match Path::new(path)
             .extension()?
@@ -53,7 +63,22 @@ impl Language {
     }
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct LanguageTestPolicy {
+    pub version: &'static str,
+    pub path_patterns: &'static [&'static str],
+    pub syntax_rules: &'static [&'static str],
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct TestExclusionPolicy {
+    pub version: &'static str,
+    pub languages: BTreeMap<String, LanguageTestPolicy>,
+}
+
 pub trait LanguageAdapter {
+    fn test_policy(&self) -> LanguageTestPolicy;
+    fn is_test_file(&self, path: &str) -> bool;
     fn analyze(&mut self, source: &[u8]) -> Result<FileAnalysis>;
 }
 

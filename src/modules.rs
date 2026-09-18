@@ -9,6 +9,7 @@ use crate::{
     Analyzer, MetricIdentity, Snapshot, SnapshotAccumulator, Status,
     git::{Commit, Repository},
     history::Checkpoint,
+    languages::TestExclusionPolicy,
 };
 
 #[derive(Clone, Serialize)]
@@ -86,6 +87,8 @@ pub struct ModuleReport {
     pub grouping: ModuleConfig,
     pub grouping_fingerprint: String,
     pub file_scope: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub test_exclusion: Option<TestExclusionPolicy>,
     pub discovered_modules: usize,
     pub inventory: Vec<ModuleInventory>,
     pub modules: Vec<ModuleSeries>,
@@ -152,16 +155,18 @@ impl Analyzer {
                         continue;
                     }
                     counts.selected_module_entries += 1;
-                    let accumulator = groups
-                        .entry(key.to_owned())
-                        .or_insert_with(|| SnapshotAccumulator::new(checkpoint));
+                    let accumulator = groups.entry(key.to_owned()).or_insert_with(|| {
+                        SnapshotAccumulator::new(checkpoint, self.test_exclusion.is_some())
+                    });
                     self.accumulate_entry(accumulator, entry, &mut reader, 0)?;
                 }
             }
             for module in &mut modules {
                 let mut snapshot = groups
                     .remove(&module.path)
-                    .unwrap_or_else(|| SnapshotAccumulator::new(checkpoint))
+                    .unwrap_or_else(|| {
+                        SnapshotAccumulator::new(checkpoint, self.test_exclusion.is_some())
+                    })
                     .finish(0);
                 if snapshot.commit.is_some() && snapshot.coverage.tracked_entries == 0 {
                     snapshot.status = Status::NoFiles;
@@ -180,14 +185,19 @@ impl Analyzer {
             inventory.push(counts);
         }
         Ok(ModuleReport {
-            schema_version: 2,
+            schema_version: if self.test_exclusion.is_some() { 4 } else { 2 },
             tool_version: env!("CARGO_PKG_VERSION"),
             mode: "modules",
             reference,
             metric: MetricIdentity::current(),
             grouping: selection.config.clone(),
-            grouping_fingerprint: selection.fingerprint.clone(),
-            file_scope: "all_tracked_entries",
+            grouping_fingerprint: self.scope_fingerprint(&selection.fingerprint)?,
+            file_scope: if self.test_exclusion.is_some() {
+                "exclude_language_tests"
+            } else {
+                "all_tracked_entries"
+            },
+            test_exclusion: self.test_exclusion.clone(),
             discovered_modules: discovered.len(),
             inventory,
             modules,

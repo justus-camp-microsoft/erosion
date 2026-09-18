@@ -10,6 +10,7 @@ pub mod output;
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
@@ -17,7 +18,7 @@ use cache::Cache;
 use config::{Config, Scope};
 use git::{BlobReader, Commit, Repository, TreeEntry};
 use history::Checkpoint;
-use languages::{Language, LanguageAdapter};
+use languages::{Language, LanguageAdapter, TestExclusionPolicy};
 use metrics::{COMPLEXITY_THRESHOLD, FunctionMetrics, METRIC_VERSION, ParseDiagnostic, Sum};
 
 #[derive(Default, Debug, Serialize)]
@@ -31,6 +32,14 @@ pub struct LanguageCoverage {
 pub struct Coverage {
     pub tracked_entries: usize,
     pub excluded_entries: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub test_excluded_entries: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub syntax_test_files: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub test_excluded_functions: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub test_excluded_source_lines: Option<usize>,
     pub non_regular_entries: usize,
     pub unsupported_files: usize,
     pub unsupported_extensions: BTreeMap<String, usize>,
@@ -128,9 +137,14 @@ struct SnapshotAccumulator {
 }
 
 impl SnapshotAccumulator {
-    fn new(checkpoint: &Checkpoint) -> Self {
+    fn new(checkpoint: &Checkpoint, exclude_tests: bool) -> Self {
+        let mut snapshot = Snapshot::empty(checkpoint);
+        snapshot.coverage.test_excluded_entries = exclude_tests.then_some(0);
+        snapshot.coverage.syntax_test_files = exclude_tests.then_some(0);
+        snapshot.coverage.test_excluded_functions = exclude_tests.then_some(0);
+        snapshot.coverage.test_excluded_source_lines = exclude_tests.then_some(0);
         Self {
-            snapshot: Snapshot::empty(checkpoint),
+            snapshot,
             total: Sum::default(),
             complex: Sum::default(),
         }
@@ -195,12 +209,15 @@ pub struct Report {
     pub metric: MetricIdentity,
     pub scope: Config,
     pub scope_fingerprint: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub test_exclusion: Option<TestExclusionPolicy>,
     pub snapshots: Vec<Snapshot>,
 }
 
 pub struct Analyzer {
     pub cache: Cache,
     adapters: HashMap<Language, Box<dyn LanguageAdapter>>,
+    test_exclusion: Option<TestExclusionPolicy>,
 }
 
 impl Analyzer {
@@ -208,7 +225,34 @@ impl Analyzer {
         Self {
             cache,
             adapters: HashMap::new(),
+            test_exclusion: None,
         }
+    }
+
+    pub fn exclude_tests(mut self) -> Result<Self> {
+        let mut policies = BTreeMap::new();
+        for language in Language::ALL {
+            let adapter = languages::adapter(language)?;
+            policies.insert(language.id().to_owned(), adapter.test_policy());
+            self.adapters.insert(language, adapter);
+        }
+        self.test_exclusion = Some(TestExclusionPolicy {
+            version: "language-tests-v1",
+            languages: policies,
+        });
+        Ok(self)
+    }
+
+    fn scope_fingerprint(&self, fingerprint: &str) -> Result<String> {
+        self.test_exclusion.as_ref().map_or_else(
+            || Ok(fingerprint.to_owned()),
+            |exclusion| {
+                Ok(format!(
+                    "{:x}",
+                    Sha256::digest(serde_json::to_vec(&(fingerprint, exclusion))?)
+                ))
+            },
+        )
     }
 
     pub fn snapshot(
@@ -218,7 +262,7 @@ impl Analyzer {
         checkpoint: &Checkpoint,
         top: usize,
     ) -> Result<Snapshot> {
-        let mut accumulator = SnapshotAccumulator::new(checkpoint);
+        let mut accumulator = SnapshotAccumulator::new(checkpoint, self.test_exclusion.is_some());
         let Some(commit) = &checkpoint.commit else {
             return Ok(accumulator.finish(top));
         };
@@ -262,6 +306,21 @@ impl Analyzer {
                 .or_default() += 1;
             return Ok(());
         };
+        if self.test_exclusion.is_some()
+            && self
+                .adapters
+                .get(&language)
+                .context("Missing language test policy")?
+                .is_test_file(&entry.path)
+        {
+            snapshot.coverage.excluded_entries += 1;
+            *snapshot
+                .coverage
+                .test_excluded_entries
+                .as_mut()
+                .context("Missing test exclusion coverage")? += 1;
+            return Ok(());
+        }
         snapshot.coverage.selected_files += 1;
         let language_coverage = snapshot
             .coverage
@@ -307,9 +366,40 @@ impl Analyzer {
         }
         snapshot.coverage.parsed_files += 1;
         snapshot.coverage.parsed_physical_lines += analysis.physical_lines;
-        snapshot.coverage.parsed_source_lines += analysis.source_lines;
+        let filtered = self
+            .test_exclusion
+            .as_ref()
+            .and(analysis.without_tests.as_ref());
+        let (source_lines, functions) = if let Some(filtered) = filtered {
+            *snapshot
+                .coverage
+                .syntax_test_files
+                .as_mut()
+                .context("Missing syntax test coverage")? += 1;
+            *snapshot
+                .coverage
+                .test_excluded_functions
+                .as_mut()
+                .context("Missing test function coverage")? += analysis
+                .functions
+                .len()
+                .checked_sub(filtered.functions.len())
+                .context("Invalid cached test-filtered function count")?;
+            *snapshot
+                .coverage
+                .test_excluded_source_lines
+                .as_mut()
+                .context("Missing test line coverage")? += analysis
+                .source_lines
+                .checked_sub(filtered.source_lines)
+                .context("Invalid cached test-filtered source count")?;
+            (filtered.source_lines, &filtered.functions)
+        } else {
+            (analysis.source_lines, &analysis.functions)
+        };
+        snapshot.coverage.parsed_source_lines += source_lines;
         language_coverage.parsed_files += 1;
-        for function in &analysis.functions {
+        for function in functions {
             snapshot.functions += 1;
             let mass = function.mass();
             accumulator.total.add(mass);
@@ -350,13 +440,14 @@ impl Analyzer {
             snapshots.push(snapshot);
         }
         Ok(Report {
-            schema_version: 1,
+            schema_version: if self.test_exclusion.is_some() { 3 } else { 1 },
             tool_version: env!("CARGO_PKG_VERSION"),
             mode,
             reference,
             metric: MetricIdentity::current(),
             scope: scope.config.clone(),
-            scope_fingerprint: scope.fingerprint.clone(),
+            scope_fingerprint: self.scope_fingerprint(&scope.fingerprint)?,
+            test_exclusion: self.test_exclusion.clone(),
             snapshots,
         })
     }

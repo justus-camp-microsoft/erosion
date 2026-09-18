@@ -1,38 +1,8 @@
-use std::{fs, path::Path, process::Command};
+use std::fs;
 
 use serde_json::Value;
 
-use super::{git, repository, run, successful_json};
-
-fn commit_at(root: &Path, date: &str) {
-    git(root, &["add", "-A"]);
-    let result = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args([
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "commit.gpgSign=false",
-            "-c",
-            "user.name=Fixture",
-            "-c",
-            "user.email=fixture@example.invalid",
-            "commit",
-            "--allow-empty",
-            "-qm",
-            "checkpoint",
-        ])
-        .env("GIT_AUTHOR_DATE", date)
-        .env("GIT_COMMITTER_DATE", date)
-        .output()
-        .unwrap();
-    assert!(
-        result.status.success(),
-        "{}",
-        String::from_utf8_lossy(&result.stderr)
-    );
-}
+use super::{commit_at, git, repository, run, successful_json};
 
 fn series<'a>(report: &'a Value, path: &str) -> &'a Vec<Value> {
     report["modules"]
@@ -636,7 +606,7 @@ fn changing_grouping_reuses_blob_cache_and_cache_errors_are_not_partial() {
         .join(format!("{oid}.json"));
     let bytes = fs::read(&record).unwrap();
     let cached: Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(cached["schema"], 1);
+    assert_eq!(cached["schema"], 2);
     assert_eq!(cached["oid"], oid);
     assert!(cached.get("grouping").is_none());
     fs::write(record, "{}").unwrap();

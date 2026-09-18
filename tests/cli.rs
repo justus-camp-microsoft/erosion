@@ -27,7 +27,14 @@ mod typescript;
 #[path = "cases/modules.rs"]
 mod modules;
 
+#[path = "cases/exclude_tests.rs"]
+mod exclude_tests;
+
 fn git(root: &Path, args: &[&str]) -> String {
+    git_at(root, args, "2025-01-01T12:00:00Z")
+}
+
+fn git_at(root: &Path, args: &[&str], date: &str) -> String {
     let output = Command::new("git")
         .arg("-C")
         .arg(root)
@@ -42,8 +49,8 @@ fn git(root: &Path, args: &[&str]) -> String {
             "user.email=fixture@example.invalid",
         ])
         .args(args)
-        .env("GIT_AUTHOR_DATE", "2025-01-01T12:00:00Z")
-        .env("GIT_COMMITTER_DATE", "2025-01-01T12:00:00Z")
+        .env("GIT_AUTHOR_DATE", date)
+        .env("GIT_COMMITTER_DATE", date)
         .output()
         .unwrap();
     assert!(
@@ -52,6 +59,15 @@ fn git(root: &Path, args: &[&str]) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+fn commit_at(root: &Path, date: &str) {
+    git(root, &["add", "-A"]);
+    git_at(
+        root,
+        &["commit", "--allow-empty", "-qm", "checkpoint"],
+        date,
+    );
 }
 
 fn repository(files: &[(&str, &str)]) -> TempDir {

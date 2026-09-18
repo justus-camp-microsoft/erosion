@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 use std::fmt::Write;
 
-use crate::{Report, Snapshot, Status, modules::ModuleReport};
+use crate::{Report, Snapshot, Status, languages::TestExclusionPolicy, modules::ModuleReport};
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum Format {
@@ -37,7 +37,8 @@ pub fn render_modules(report: &ModuleReport, format: Format) -> Result<Vec<u8>> 
 
 fn modules_table(report: &ModuleReport) -> Result<Vec<u8>> {
     let mut text = String::new();
-    writeln!(text, "Erosion whole-module history\n")?;
+    let label = test_label(report.test_exclusion.is_some());
+    writeln!(text, "Erosion whole-module history{label}\n")?;
     for module in &report.modules {
         writeln!(text, "Module: {}", module.path.escape_debug())?;
         header(&mut text, "Checkpoint")?;
@@ -55,6 +56,7 @@ fn modules_table(report: &ModuleReport) -> Result<Vec<u8>> {
 
 fn table(report: &Report) -> Result<Vec<u8>> {
     let mut text = String::new();
+    let label = test_label(report.test_exclusion.is_some());
     match report.mode {
         "measure" => {
             let [snapshot] = report.snapshots.as_slice() else {
@@ -69,11 +71,11 @@ fn table(report: &Report) -> Result<Vec<u8>> {
             match to.change_pp {
                 Some(change) => writeln!(
                     text,
-                    "Erosion delta (TO - FROM): {change:+.2} percentage points\n"
+                    "Erosion delta (TO - FROM){label}: {change:+.2} percentage points\n"
                 )?,
                 None => writeln!(
                     text,
-                    "Erosion delta (TO - FROM): not measurable (one or both scores unavailable)\n"
+                    "Erosion delta (TO - FROM){label}: not measurable (one or both scores unavailable)\n"
                 )?,
             }
             from.commit
@@ -85,7 +87,7 @@ fn table(report: &Report) -> Result<Vec<u8>> {
             row(&mut text, "TO", to)?;
         }
         "history" => {
-            writeln!(text, "Erosion history\n")?;
+            writeln!(text, "Erosion history{label}\n")?;
             header(&mut text, "Checkpoint")?;
             for snapshot in &report.snapshots {
                 row(
@@ -170,6 +172,14 @@ fn number(value: usize) -> String {
     grouped
 }
 
+fn test_label(exclude_tests: bool) -> &'static str {
+    if exclude_tests {
+        " (tests excluded)"
+    } else {
+        ""
+    }
+}
+
 fn score(snapshot: &Snapshot) -> String {
     snapshot
         .erosion_pct
@@ -230,7 +240,8 @@ fn measure(text: &mut String, snapshot: &Snapshot) -> Result<()> {
     } else {
         ""
     };
-    writeln!(text, "Erosion: {score}{partial}")?;
+    let label = test_label(snapshot.coverage.test_excluded_entries.is_some());
+    writeln!(text, "Erosion{label}: {score}{partial}")?;
     writeln!(
         text,
         "Commit:  {} ({})\n",
@@ -291,7 +302,7 @@ fn measure(text: &mut String, snapshot: &Snapshot) -> Result<()> {
 
 fn csv(report: &Report) -> Result<Vec<u8>> {
     let mut writer = csv::Writer::from_writer(Vec::new());
-    writer.write_record([
+    let mut headers = vec![
         "schema_version",
         "tool_version",
         "metric_version",
@@ -322,10 +333,20 @@ fn csv(report: &Report) -> Result<Vec<u8>> {
         "languages_json",
         "unsupported_extensions_json",
         "failures_json",
-    ])?;
+    ];
+    if report.test_exclusion.is_some() {
+        headers.extend([
+            "test_exclusion_json",
+            "test_excluded_entries",
+            "syntax_test_files",
+            "test_excluded_functions",
+            "test_excluded_source_lines",
+        ]);
+    }
+    writer.write_record(headers)?;
     for snapshot in &report.snapshots {
         let coverage = &snapshot.coverage;
-        writer.write_record([
+        let mut record = vec![
             report.schema_version.to_string(),
             report.tool_version.to_owned(),
             report.metric.version.to_owned(),
@@ -370,7 +391,9 @@ fn csv(report: &Report) -> Result<Vec<u8>> {
             serde_json::to_string(&coverage.languages)?,
             serde_json::to_string(&coverage.unsupported_extensions)?,
             serde_json::to_string(&snapshot.failures)?,
-        ])?;
+        ];
+        append_test_exclusion(&mut record, report.test_exclusion.as_ref(), snapshot)?;
+        writer.write_record(record)?;
     }
     writer.flush()?;
     Ok(writer.into_inner()?)
@@ -378,7 +401,7 @@ fn csv(report: &Report) -> Result<Vec<u8>> {
 
 fn modules_csv(report: &ModuleReport) -> Result<Vec<u8>> {
     let mut writer = csv::Writer::from_writer(Vec::new());
-    writer.write_record([
+    let mut headers = vec![
         "schema_version",
         "tool_version",
         "mode",
@@ -420,7 +443,17 @@ fn modules_csv(report: &ModuleReport) -> Result<Vec<u8>> {
         "erosion_pct",
         "change_pp",
         "failures_json",
-    ])?;
+    ];
+    if report.test_exclusion.is_some() {
+        headers.extend([
+            "test_exclusion_json",
+            "test_excluded_entries",
+            "syntax_test_files",
+            "test_excluded_functions",
+            "test_excluded_source_lines",
+        ]);
+    }
+    writer.write_record(headers)?;
     let metric_json = serde_json::to_string(&report.metric)?;
     let grouping_json = serde_json::to_string(&report.grouping)?;
     let reference_json = serde_json::to_string(&report.reference)?;
@@ -431,7 +464,7 @@ fn modules_csv(report: &ModuleReport) -> Result<Vec<u8>> {
                 .get(index)
                 .context("Missing module inventory checkpoint")?;
             let coverage = &snapshot.coverage;
-            writer.write_record([
+            let mut record = vec![
                 report.schema_version.to_string(),
                 report.tool_version.to_owned(),
                 report.mode.to_owned(),
@@ -487,9 +520,44 @@ fn modules_csv(report: &ModuleReport) -> Result<Vec<u8>> {
                     .map(|value| value.to_string())
                     .unwrap_or_default(),
                 serde_json::to_string(&snapshot.failures)?,
-            ])?;
+            ];
+            append_test_exclusion(&mut record, report.test_exclusion.as_ref(), snapshot)?;
+            writer.write_record(record)?;
         }
     }
     writer.flush()?;
     Ok(writer.into_inner()?)
+}
+
+fn append_test_exclusion(
+    record: &mut Vec<String>,
+    policy: Option<&TestExclusionPolicy>,
+    snapshot: &Snapshot,
+) -> Result<()> {
+    if let Some(policy) = policy {
+        record.extend([
+            serde_json::to_string(policy)?,
+            snapshot
+                .coverage
+                .test_excluded_entries
+                .context("Missing test exclusion coverage")?
+                .to_string(),
+            snapshot
+                .coverage
+                .syntax_test_files
+                .context("Missing syntax test coverage")?
+                .to_string(),
+            snapshot
+                .coverage
+                .test_excluded_functions
+                .context("Missing test function coverage")?
+                .to_string(),
+            snapshot
+                .coverage
+                .test_excluded_source_lines
+                .context("Missing test line coverage")?
+                .to_string(),
+        ]);
+    }
+    Ok(())
 }

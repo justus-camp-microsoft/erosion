@@ -12,12 +12,14 @@ server, plugin loader, AST-Grep dependency, or project-code execution.
   here and is restricted to read-only plumbing.
 - `history.rs`: UTC duration/calendar arithmetic and checkpoint-to-commit
   selection. Repository birth is represented by absent commits, not zero scores.
-- `config.rs`: one invocation's frozen include/exclude scope and fingerprint.
+- `config.rs`: frozen include/exclude scope and selection fingerprints.
 - `languages/`: language routing and adapter interface. JavaScript-family,
   Python, Rust, and Gleam adapters select bundled grammars and define callable,
-  decision, naming, ignored-source, and grammar-validation rules.
-  `languages/tree.rs` owns their shared traversal,
-  diagnostics, nested-decision aggregation, and source-line accounting.
+  decision, naming, ignored-source, and grammar-validation rules. Each adapter
+  also owns its test-file paths, syntax classification, and versioned policy.
+  `languages/tree.rs` owns shared glob mechanics, traversal, diagnostics,
+  test-region masking, nested-decision aggregation, and source-line accounting;
+  it contains no language or framework test heuristics.
   The central adapter factory routes every `Language` variant explicitly.
   Family adapters accept only their supported languages and reject all others
   generically, so new languages do not require edits to unrelated adapters.
@@ -33,9 +35,11 @@ server, plugin loader, AST-Grep dependency, or project-code execution.
 
 ## Metric invariants
 
-Language adapters do not choose repository scope or calculate historical
-changes. They return the same analysis for a given byte sequence and grammar,
-regardless of pathname. Scope decisions must never enter the blob cache.
+Language adapters do not choose repository/module selection or calculate
+historical changes. Their `is_test_file` method classifies supported source paths
+separately from `analyze`, which returns the same raw and syntax-filtered views
+for a given byte sequence and grammar, regardless of pathname or command flags.
+Path decisions must never enter the blob cache.
 
 Function mass is `CC * sqrt(SLOC)`. The erosion numerator includes only
 functions with `CC > 10`; the denominator includes all measured functions.
@@ -57,15 +61,17 @@ count as source lines.
 
 Parser versions are pinned. The analyzer identity covers measurement source,
 language routing, parser versions, metric version, and cache schema. TypeScript/TSX
-come from the `justus-camp-microsoft/tree-sitter-typescript` fork through a
-`[patch.crates-io]` override pinned to a full Git revision, also recorded in
-`Cargo.lock`. Cargo retrieves the dependency at build time; the CLI never downloads
+and Rust come from the `justus-camp-microsoft/tree-sitter-typescript` and
+`justus-camp-microsoft/tree-sitter-rust` forks through `[patch.crates-io]`
+overrides pinned to full Git revisions, also recorded in `Cargo.lock`.
+Cargo retrieves the dependencies at build time; the CLI never downloads
 parsers at runtime. There is no local vendored copy or dependency on a sibling checkout.
-The fork crate also hashes its grammar inputs, generated parsers, scanners,
-headers, bindings, and build inputs at build time. Only the resulting digest enters
+Each fork crate also hashes its grammar inputs, generated parsers, scanners,
+headers, bindings, and build inputs at build time. Only the resulting digests enter
 the analyzer fingerprint, not an extra copy of the generated C in the executable.
-Both dialects are regenerated together from pinned tooling; provenance and commands
-live in the fork's `EROSION.md`. Compatibility fixes must preserve
+Generated parsers use pinned tooling and an ABI supported by the pinned runtime;
+both TypeScript dialects are regenerated together. Provenance and commands
+live in each fork's `EROSION.md`. Compatibility fixes must preserve
 strict diagnostics rather than rewriting source or ignoring error nodes. Changing
 counting behavior must preserve cache invalidation and update the documented
 metric contract/version when semantics change.
@@ -92,6 +98,78 @@ Configuration is loaded once from the explicit file or selected worktree root,
 not from historical commits. The same effective scope applies at every
 checkpoint. Inclusion is independent of whether a file is supported by an
 adapter; unsupported files remain visible in coverage.
+
+`--exclude-tests` is an explicit opt-in on `measure`, `history`, `delta`, and
+`modules`. Its `language-tests-v1` policy records every adapter's version,
+exact path patterns, and syntax rules in filtered reports. Paths are
+case-sensitive; wildcards within a component do not cross `/`. Concrete naming,
+framework, binding, and syntax decisions live in the owning language module,
+not configuration, routing, aggregation, or the shared tree walker.
+
+Normal scope or module selection happens first. Non-regular and unsupported
+entries retain their normal coverage categories: an asset has no source-language
+owner, and links/gitlinks are never followed. The selected language then decides
+whether a supported regular source file is a test path. Matching source files,
+including source helpers beneath test directories, are counted but never read,
+parsed, or looked up in the blob cache. `coverage.test_excluded_entries` is a
+subset of `excluded_entries`, not an additional category; ordinary configuration
+exclusions are not counted again. There is no separate generated-code, bundle,
+or benchmark filter.
+
+For retained source files, the adapter also identifies test-only syntax:
+
+- JavaScript/TypeScript/TSX resolves literal ESM/CommonJS imports for Node test,
+  Jest, Vitest, Mocha, AVA, Tape, Playwright, and uvu, including aliases,
+  namespaces, destructuring, common modifiers, parameterized tests and fixtures.
+  Ambient suite/test globals require framework-import evidence or an unshadowed
+  suite containing test callbacks in the same scope. Local helpers are removed
+  only when references connect them exclusively to test regions; shared,
+  exported, shadowed, reassigned, or dynamically uncertain code is retained.
+- Python classifies unittest subclasses and pytest tests/fixtures using
+  framework bindings and language-specific discovery conventions. Paths cover
+  `test`/`tests`/`__tests__` directories, `test_*`, `*_test`, and `conftest`
+  source files. In mixed files, fixtures require a bound pytest decorator;
+  other pytest definitions require a bound mark and a discoverable test name.
+  unittest main calls and a pure `__main__` test-runner guard are recognized.
+  Bare names/imports, assignment aliases, module `pytestmark`, and ambiguous
+  inheritance or dynamic bindings are not enough.
+- Rust classifies test attributes and syntax whose conditional compilation
+  provably requires test mode, including inline test modules. Only `tests`
+  directories and `tests.rs` receive whole-file path exclusion. Known attributes
+  include built-in `test`, `tokio::test`, `async_std::test`, `rstest::rstest` and
+  `test_case::test_case`, with explicit import/crate aliases. Three-valued
+  `cfg`/`cfg_attr` evaluation requires definite absence outside test mode and
+  possible presence in test mode; unrelated predicates remain unknown.
+- Gleam recognizes public zero-argument `*_test` functions and Erlang EUnit
+  `*_test_` generators independently of imports. Zero-argument `gleeunit.main()`
+  calls require unshadowed module/selective imports; pure runner wrappers and
+  exclusively test-referenced private helpers/imports are removed. Assertions,
+  parameterized/private lookalikes, dynamic runner aliases and unknown DSLs
+  do not establish tests.
+
+This is conservative static classification, not execution of a test runner,
+imports, configuration, macros, or arbitrary project code. Assertions alone do
+not establish a test. Unresolved cross-file/custom wrappers and dynamically
+rebound APIs remain included rather than being guessed away. Language policies
+in reports describe the supported cases and limits.
+
+Raw parsing and language validation must succeed before syntax exclusion.
+An error inside apparent test syntax still fails the file; `--allow-partial`
+retains the existing explicit failure policy. The shared engine normalizes
+bounded byte regions, preserves line endings, and traverses the original AST
+without excluded subtrees. It recomputes SLOC and CC for surviving callables:
+test decisions and lines cannot remain in an enclosing production function.
+Raw measurements remain available unchanged. Region byte offsets refer to the
+original blob, including any UTF-8 BOM.
+
+`coverage.syntax_test_files` counts parsed files with syntax exclusions.
+`test_excluded_functions` and `test_excluded_source_lines` are raw-minus-filtered
+counts for those files only; path-skipped files are not parsed to count their
+contents. Source-line counts are per file, not summed overlapping function
+spans. Such files stay parsed, even if no measured function remains.
+Test-only modules stay present and `not_measurable`; discovery and inventory do
+not depend on filtering. The effective scope/grouping fingerprint includes the
+policy, and the analyzer identity covers every adapter and shared analysis rule.
 
 First-parent history is traversed before selecting calendar checkpoints.
 Selection uses chain order with a timestamp predicate, not timestamp sorting,
@@ -133,7 +211,9 @@ counted non-regular entries when beneath a selected directory.
 Repeated `--glob` options select the union of matching discovered module keys.
 `*` does not cross `/`; `**` can. They never filter files within selected modules.
 All tracked descendants of selected module paths are inventoried; all supported
-regular source files are analyzed, including tests and generated code.
+regular source files are analyzed by default, including tests and generated code.
+`--exclude-tests` applies only after discovery and module-glob selection, without
+changing module identities or repository inventory counts.
 Unsupported files and non-regular entries remain visible in coverage. Links
 and submodules are not followed. `modules` does not accept `--config` and never
 loads `erosion.toml`, even when that file contains invalid or excluding rules.
@@ -141,7 +221,8 @@ Unmatched selections fail explicitly without emitting an empty result.
 
 Discovery inspects tree inventories, not source bodies. Analysis then streams
 each checkpoint once for all selected modules and reuses the existing blob cache.
-Module keys, depth, and filters never enter language adapters or cached analyses.
+Grouping parameters never enter adapters or cached analyses. Full source paths
+are passed only to the language-owned test-file classifier, not blob analysis.
 The shared accumulator combines function masses and coverage identically for
 repository-wide and module reports.
 
@@ -173,8 +254,9 @@ are never gated by verbosity; partial and unmeasurable states stay visible in
 the human summary.
 
 Persistent cache records are private local analysis artifacts. They store
-function names/locations, numeric measurements, and parse diagnostics, not
-source bodies. Content-addressed identity and atomic writes permit reuse
+function names/locations, numeric measurements, parse diagnostics, and optional
+test-region offsets/reasons and filtered views, not source bodies.
+Content-addressed identity and atomic writes permit reuse
 between invocations without a mutable repository database. Cache entries are
 reconstructible and not guaranteed durable across power loss: writes do not
 force a device flush for each blob. Malformed cache records require explicit
@@ -182,16 +264,31 @@ recovery; `--no-cache` is an escape hatch.
 
 There are no migrations, durable event streams, or changes to existing
 repository data. Report schema and cache schema are versioned separately.
-Delta uses report schema 1 with the additional `mode` value `delta`; its ordered
-snapshots and CSV rows reuse existing fields. Metric identity and cache schema
-are unchanged.
+Delta uses unfiltered report schema 1 with `mode: "delta"`; its ordered snapshots
+and CSV rows reuse existing fields. Cache schema 2 stores raw analysis plus an
+optional `without_tests` view containing source-line counts, function metrics,
+and normalized test regions. A single record serves both flag settings and
+all paths with the same blob/language. The new analyzer namespace bypasses old
+cache records without rewriting them; no migration is needed.
 
-Module reports use their own schema-2 `mode: "modules"` shape with grouping
+Unfiltered reports retain their existing JSON/CSV shapes and versions. Explicit
+test exclusion uses report schema 3 for `measure`/`history`/`delta` and schema 4
+for `modules`. These filtered shapes add `test_exclusion` policy provenance,
+`coverage.test_excluded_entries`, `syntax_test_files`, `test_excluded_functions`,
+and `test_excluded_source_lines` (including zeros at absent checkpoints). CSV
+appends `test_exclusion_json` and the four coverage counters. Human output
+labels the score/history heading with `tests excluded` and includes excluded
+entries in the existing skipped counts, without an explanatory footer.
+
+Unfiltered module reports use their own schema-2 `mode: "modules"` shape with grouping
 parameters/fingerprint (including `kind: "directories"`),
 `file_scope: "all_tracked_entries"`, the discovered module count, repository
 inventory per checkpoint, and path-sorted module series containing checkpoint
 snapshots. JSON retains per-module coverage and failures; CSV has one row per
-module/checkpoint with the corresponding repository inventory counts. Directory
+module/checkpoint with the corresponding repository inventory counts. Filtered
+module reports use `file_scope: "exclude_language_tests"`; selected inventory entries
+still include the entries explicitly excluded from analysis as tests. Directory
 grouping identity is distinct from file-leaf grouping; those module reports
 must not be compared as if their scopes were identical.
-Existing command report shapes, metric rules, and cache records are unchanged.
+The raw metric formula/counting profile remains unchanged, but filtered scores
+from a different test-policy/analyzer identity are not directly comparable.

@@ -26,11 +26,29 @@ pub struct ParseDiagnostic {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct TestRegion {
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct TestFilteredAnalysis {
+    pub source_lines: usize,
+    pub functions: Vec<FunctionMetrics>,
+    pub regions: Vec<TestRegion>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct FileAnalysis {
     pub physical_lines: usize,
     pub source_lines: usize,
     pub functions: Vec<FunctionMetrics>,
     pub diagnostics: Vec<ParseDiagnostic>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub without_tests: Option<TestFilteredAnalysis>,
 }
 
 impl FileAnalysis {

@@ -5,6 +5,8 @@ use super::{git, repository, run, successful_json};
 const SOURCE: &str = "\
 export type * from './types';\n\
 export type * as api from './types';\n\
+export { type, type Item, type as value, value as type } from './types';\n\
+export type { type, type as NamedType } from './types';\n\
 export interface Box<out T> { readonly value: T; }\n\
 export interface Cell<in out T> { get(): T; set(value: T): void; }\n\
 export interface Named<out> { value: out; }\n\
@@ -14,7 +16,8 @@ export function choose(x: boolean) {\n\
   if (x && ready()) return 1;\n\
   return x ? 2 : 3;\n\
 }\n\
-const selected = items.filter((item: Item) => item.value < -1,);\n";
+const selected = items.filter((item: Item) => item.value < -1,);\n\
+const stub = sandbox.stub<[type: string, readonly?: boolean, ...unknown: string[]], void>().callsFake(choose);\n";
 
 #[test]
 fn modern_typescript_routes_all_extensions_and_reuses_cache() {
@@ -93,12 +96,20 @@ fn malformed_typescript_is_still_a_strict_failure() {
             "bad-arrow.ts",
             "const selected = items.filter((item: Item) => item.value < ,);\n",
         ),
+        ("bad-export.ts", "export { type as } from './types';"),
+        ("bad-tuple.tsx", "sandbox.stub<[type: ], void>();"),
     ]);
     let strict = run(repo.path(), &["measure", "--no-cache", "--format", "json"]);
     assert_eq!(strict.status.code(), Some(1));
     assert!(strict.stdout.is_empty());
     let stderr = String::from_utf8(strict.stderr).unwrap();
-    for path in ["bad.ts", "bad.tsx", "bad-arrow.ts"] {
+    for path in [
+        "bad.ts",
+        "bad.tsx",
+        "bad-arrow.ts",
+        "bad-export.ts",
+        "bad-tuple.tsx",
+    ] {
         assert!(stderr.contains(path), "{stderr}");
     }
     let partial = successful_json(
@@ -112,6 +123,6 @@ fn malformed_typescript_is_still_a_strict_failure() {
         ],
     );
     assert_eq!(partial["snapshots"][0]["status"], "partial");
-    assert_eq!(partial["snapshots"][0]["coverage"]["failed_files"], 3);
+    assert_eq!(partial["snapshots"][0]["coverage"]["failed_files"], 5);
     assert_eq!(partial["snapshots"][0]["coverage"]["parsed_files"], 1);
 }
