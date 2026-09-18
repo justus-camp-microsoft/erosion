@@ -78,6 +78,14 @@ impl Scope {
         })
     }
 
+    pub fn with_exclusions(mut self, patterns: &[String]) -> Result<Self> {
+        if patterns.is_empty() {
+            return Ok(self);
+        }
+        self.config.exclude.extend_from_slice(patterns);
+        Self::build(self.config, self.config_path)
+    }
+
     pub fn contains(&self, path: &str) -> bool {
         self.include.is_match(path) && !self.exclude.is_match(path)
     }
@@ -120,5 +128,45 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         assert!(Scope::load(root.path(), None).is_ok());
         assert!(Scope::load(root.path(), Some(&root.path().join("missing"))).is_err());
+    }
+
+    #[test]
+    fn extra_exclusions_preserve_config_and_fingerprint_the_effective_scope() {
+        let config = Config {
+            include: vec!["src/**".into()],
+            exclude: vec!["**/generated/**".into()],
+        };
+        let config_path = Some(PathBuf::from("custom.toml"));
+        let scope = Scope::build(config.clone(), config_path.clone()).unwrap();
+        let original_fingerprint = scope.fingerprint.clone();
+        let scope = scope.with_exclusions(&[]).unwrap();
+        assert_eq!(scope.fingerprint, original_fingerprint);
+        let extra = vec!["*.min.js".into(), "**/*.{map,snap}".into()];
+        let scope = scope.with_exclusions(&extra).unwrap();
+        assert_eq!(scope.config_path, config_path);
+        assert_eq!(scope.config.include, config.include);
+        assert_eq!(
+            scope.config.exclude,
+            ["**/generated/**", "*.min.js", "**/*.{map,snap}"]
+        );
+        assert!(scope.contains("src/kept.js"));
+        for path in [
+            "src/generated/code.js",
+            "src/deep/bundle.min.js",
+            "src/deep/bundle.map",
+            "src/output.snap",
+            "outside/kept.js",
+        ] {
+            assert!(!scope.contains(path), "{path}");
+        }
+        assert!(scope.contains("src/bundle.MIN.js"));
+        assert_ne!(scope.fingerprint, original_fingerprint);
+        let mut merged = config;
+        merged.exclude.extend(extra);
+        assert_eq!(
+            scope.fingerprint,
+            Scope::build(merged, None).unwrap().fingerprint
+        );
+        assert!(scope.with_exclusions(&["[".into()]).is_err());
     }
 }

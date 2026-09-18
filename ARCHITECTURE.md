@@ -109,9 +109,18 @@ and explicit cache paths are invocation-relative. Cache containment is checked
 against the selected worktree, not the invocation directory.
 
 Configuration is loaded once from the explicit file or selected worktree root,
-not from historical commits. The same effective scope applies at every
-checkpoint. Inclusion is independent of whether a file is supported by an
-adapter; unsupported files remain visible in coverage.
+not from historical commits. On `measure`, `history`, and `delta`, repeated
+`--exclude-paths GLOB` values append to the configured exclusions without
+replacing configured include or exclude patterns. They use the same
+case-sensitive, repository-relative glob matching as configuration, including
+`*` matching across directory separators. The combined scope is recorded in
+reports and its fingerprint, and applies at every checkpoint before language
+test detection or blob/cache access. Invalid globs fail explicitly before
+analysis. `modules` does not accept this option; whole-module selection and
+analysis are unchanged.
+
+Inclusion is independent of whether a file is supported by an adapter;
+unsupported files remain visible in coverage when not excluded by scope.
 
 `--exclude-tests` is an explicit opt-in on `measure`, `history`, `delta`, and
 `modules`. Its `language-tests-v1` policy records every adapter's version,

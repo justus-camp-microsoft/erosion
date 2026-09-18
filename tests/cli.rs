@@ -30,6 +30,9 @@ mod modules;
 #[path = "cases/exclude_tests.rs"]
 mod exclude_tests;
 
+#[path = "cases/path_exclusions.rs"]
+mod path_exclusions;
+
 fn git(root: &Path, args: &[&str]) -> String {
     git_at(root, args, "2025-01-01T12:00:00Z")
 }

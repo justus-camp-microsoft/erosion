@@ -147,12 +147,6 @@ fn table(report: &Report) -> Result<Vec<u8>> {
     {
         writeln!(text, "No commit: no ancestor at or before the checkpoint.")?;
     }
-    if report.scope.include != ["**"] || !report.scope.exclude.is_empty() {
-        writeln!(
-            text,
-            "Scope: custom include/exclude rules (details in JSON/CSV)."
-        )?;
-    }
     writeln!(
         text,
         "\nCommitted source only; uncommitted changes ignored."

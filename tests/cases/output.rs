@@ -95,7 +95,7 @@ fn failures_are_always_visible_and_partial_null_is_not_zero() {
     let text = String::from_utf8(partial.stdout).unwrap();
     assert!(text.starts_with("Erosion: not measurable (partial)\n"));
     assert!(text.contains("Parse failures: 1"));
-    assert!(text.contains("Scope: custom include/exclude rules"));
+    assert!(!text.contains("Scope:"));
     assert!(!text.contains("0.00%"));
     let invalid = run(
         repo.path(),

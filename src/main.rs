@@ -116,6 +116,9 @@ struct Common {
     /// Scope configuration. Defaults to erosion.toml at the repository root, if present.
     #[arg(long)]
     config: Option<PathBuf>,
+    /// Exclude repository-relative paths matching GLOB, in addition to configured exclusions. Repeat for multiple globs; quote patterns to prevent shell expansion.
+    #[arg(long, value_name = "GLOB")]
+    exclude_paths: Vec<String>,
 }
 
 #[derive(Args)]
@@ -203,9 +206,10 @@ fn run(cli: Cli) -> Result<()> {
     let scope = match &cli.command {
         Command::Measure { common, .. }
         | Command::History { common, .. }
-        | Command::Delta { common, .. } => {
-            ReportScope::Configured(Scope::load(&repo.root, common.config.as_deref())?)
-        }
+        | Command::Delta { common, .. } => ReportScope::Configured(
+            Scope::load(&repo.root, common.config.as_deref())?
+                .with_exclusions(&common.exclude_paths)?,
+        ),
         Command::Modules { depth, globs, .. } => {
             ReportScope::Modules(ModuleSelection::new(*depth, globs.clone())?)
         }
