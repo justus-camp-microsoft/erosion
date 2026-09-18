@@ -13,13 +13,19 @@ server, plugin loader, AST-Grep dependency, or project-code execution.
 - `history.rs`: UTC duration/calendar arithmetic and checkpoint-to-commit
   selection. Repository birth is represented by absent commits, not zero scores.
 - `config.rs`: frozen include/exclude scope and selection fingerprints.
-- `languages/`: language routing and adapter interface. JavaScript-family,
-  Python, Rust, and Gleam adapters select bundled grammars and define callable,
-  decision, naming, ignored-source, and grammar-validation rules. Each adapter
-  also owns its test-file paths, syntax classification, and versioned policy.
+- `languages/`: language routing and object-safe adapter interface. JavaScript-family,
+  Python, Rust, and Gleam modules select bundled grammars and define callable,
+  decision, naming, ignored-source, and grammar-validation rules. Each language
+  also supplies a separate detector owning its test-file paths, syntax
+  classification, initialization, and versioned policy.
   `languages/tree.rs` owns shared glob mechanics, traversal, diagnostics,
   test-region masking, nested-decision aggregation, and source-line accounting;
-  it contains no language or framework test heuristics.
+  it contains no language or framework test heuristics. Its private
+  `TreeSitterAdapter<Rules, Policy>` uses either `AllCode` or
+  `ExcludeTests<Rules::Tests>` behind `Box<dyn LanguageAdapter>`. The same
+  parsing/measurement function serves both policies; only the exclusion policy
+  constructs or invokes a detector. Generic policy parameters do not propagate
+  through the analyzer, commands, or reports.
   The central adapter factory routes every `Language` variant explicitly.
   Family adapters accept only their supported languages and reject all others
   generically, so new languages do not require edits to unrelated adapters.
@@ -36,10 +42,18 @@ server, plugin loader, AST-Grep dependency, or project-code execution.
 ## Metric invariants
 
 Language adapters do not choose repository/module selection or calculate
-historical changes. Their `is_test_file` method classifies supported source paths
-separately from `analyze`, which returns the same raw and syntax-filtered views
-for a given byte sequence and grammar, regardless of pathname or command flags.
-Path decisions must never enter the blob cache.
+historical changes. `LanguageRules` requires an associated `TestDetector` with
+explicit construction, policy, path-classification, and syntax-region methods;
+none has a default implementation. `SyntaxRules` contains metric rules only.
+Raw adapters hold no detector: they do not initialize test-path globs, obtain
+test-policy metadata, or classify paths or syntax. An unfinished detector cannot
+affect raw measurement. Exclusion is an explicit application policy, not a
+language capability inferred from missing methods or empty results.
+
+With exclusion enabled, `is_test_file` classifies supported source paths
+separately from source analysis. Raw metrics remain the same for a given byte
+sequence and grammar. Syntax-filtered views are computed only on request and
+remain independent of pathname. Path decisions must never enter the blob cache.
 
 Function mass is `CC * sqrt(SLOC)`. The erosion numerator includes only
 functions with `CC > 10`; the denominator includes all measured functions.
@@ -265,11 +279,28 @@ recovery; `--no-cache` is an escape hatch.
 There are no migrations, durable event streams, or changes to existing
 repository data. Report schema and cache schema are versioned separately.
 Delta uses unfiltered report schema 1 with `mode: "delta"`; its ordered snapshots
-and CSV rows reuse existing fields. Cache schema 2 stores raw analysis plus an
-optional `without_tests` view containing source-line counts, function metrics,
-and normalized test regions. A single record serves both flag settings and
-all paths with the same blob/language. The new analyzer namespace bypasses old
-cache records without rewriting them; no migration is needed.
+and CSV rows reuse existing fields. Cache schema 3 separates raw analysis from
+derived test-exclusion analysis. Raw records live under
+`<analyzer>/raw/<language>/<blob-prefix>/<blob>.json` and never contain a
+filtered view. Derived records live under
+`<analyzer>/test-exclusion/<policy-fingerprint>/<language>/<blob-prefix>/<blob>.json`;
+their identity also checks the language-owned policy fingerprint. Each record
+has its own payload checksum and atomic publication.
+
+A missing derived record means detection has not been computed. A stored
+`without_tests: null` explicitly means detection completed without matching
+regions; a missing payload field is invalid. Non-null views contain source-line
+counts, function metrics, and normalized test regions. Failed parses are stored
+only as raw diagnostics and never produce a derived success.
+
+A cold exclusion run parses once and publishes raw and derived records. A raw
+cache hit alone cannot satisfy an exclusion request: a missing derived view
+requires reparsing the source and computing exclusion. Recomputed raw metrics
+must agree with cached metrics, and existing raw records are not rewritten.
+Raw runs do not read, create, or repair derived records, even if those records
+exist or are corrupt. Both layers remain path-independent and reusable across
+commands and checkpoints. The new analyzer namespace bypasses old cache
+records without rewriting them; no migration is needed.
 
 Unfiltered reports retain their existing JSON/CSV shapes and versions. Explicit
 test exclusion uses report schema 3 for `measure`/`history`/`delta` and schema 4

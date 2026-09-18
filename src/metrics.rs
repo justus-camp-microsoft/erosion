@@ -42,6 +42,14 @@ pub struct TestFilteredAnalysis {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct TestExclusionAnalysis {
+    // A stored null means detection completed without matching any regions.
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub without_tests: Option<TestFilteredAnalysis>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct FileAnalysis {
     pub physical_lines: usize,
     pub source_lines: usize,

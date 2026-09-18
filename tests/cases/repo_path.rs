@@ -128,6 +128,7 @@ fn scope_and_cache_paths_stay_relative_to_caller_not_selected_repository() {
             .path()
             .join("analysis-cache")
             .join(fingerprint)
+            .join("raw")
             .join("python")
             .join(&oid[..2])
             .join(format!("{oid}.json"))

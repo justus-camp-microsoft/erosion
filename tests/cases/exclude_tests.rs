@@ -24,6 +24,189 @@ fn snapshots(report: &Value) -> Vec<&Value> {
     }
 }
 
+fn rust_cache_path(
+    cache: &std::path::Path,
+    fingerprint: &str,
+    oid: &str,
+    derived: bool,
+) -> std::path::PathBuf {
+    let base = cache.join(fingerprint);
+    let base = if derived {
+        let policy = erosion::languages::adapter(erosion::languages::Language::Rust, true)
+            .unwrap()
+            .test_policy()
+            .unwrap()
+            .fingerprint()
+            .unwrap();
+        base.join("test-exclusion").join(policy)
+    } else {
+        base.join("raw")
+    };
+    base.join("rust")
+        .join(&oid[..2])
+        .join(format!("{oid}.json"))
+}
+
+#[test]
+fn all_commands_keep_raw_and_derived_caches_separate_in_both_mode_orders() {
+    let repo = repository(&[
+        (
+            "pkg/mixed.rs",
+            "fn production() {}\n#[test]\nfn a_test() { if true { work(); } }\n",
+        ),
+        ("pkg/clean.rs", "fn another() {}\n"),
+    ]);
+    let mixed_oid = git(repo.path(), &["rev-parse", "HEAD:pkg/mixed.rs"]);
+    let clean_oid = git(repo.path(), &["rev-parse", "HEAD:pkg/clean.rs"]);
+    for command in commands() {
+        for filtered_first in [false, true] {
+            let cache = tempfile::tempdir().unwrap();
+            for filtered in [filtered_first, !filtered_first] {
+                let mut args = command.clone();
+                args.extend([
+                    "--format",
+                    "json",
+                    "--cache-dir",
+                    cache.path().to_str().unwrap(),
+                ]);
+                if filtered {
+                    args.push("--exclude-tests");
+                }
+                let cold = run(repo.path(), &args);
+                assert!(
+                    cold.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&cold.stderr)
+                );
+                assert!(cold.stderr.is_empty());
+                let warm = run(repo.path(), &args);
+                assert!(warm.status.success());
+                assert_eq!(warm.stdout, cold.stdout);
+                let mut uncached = command.clone();
+                uncached.extend(["--format", "json", "--no-cache"]);
+                if filtered {
+                    uncached.push("--exclude-tests");
+                }
+                let no_cache = run(repo.path(), &uncached);
+                assert!(no_cache.status.success());
+                assert_eq!(no_cache.stdout, cold.stdout);
+                let report: Value = serde_json::from_slice(&cold.stdout).unwrap();
+                let fingerprint = report["metric"]["analyzer_fingerprint"].as_str().unwrap();
+                for point in snapshots(&report)
+                    .into_iter()
+                    .filter(|p| !p["commit"].is_null())
+                {
+                    assert_eq!(point["status"], "complete");
+                    assert_eq!(point["functions"], if filtered { 2 } else { 3 });
+                    if filtered {
+                        assert_eq!(point["coverage"]["syntax_test_files"], 1);
+                        assert_eq!(point["coverage"]["test_excluded_functions"], 1);
+                    }
+                }
+                for oid in [&mixed_oid, &clean_oid] {
+                    let raw_path = rust_cache_path(cache.path(), fingerprint, oid, false);
+                    let raw_bytes = fs::read(&raw_path).unwrap();
+                    let raw: Value = serde_json::from_slice(&raw_bytes).unwrap();
+                    assert_eq!(raw["schema"], 3);
+                    assert!(raw["test_policy"].is_null());
+                    assert!(raw["analysis"].get("without_tests").is_none());
+                    let derived_path = rust_cache_path(cache.path(), fingerprint, oid, true);
+                    if !filtered && !filtered_first {
+                        assert!(!derived_path.exists());
+                        assert!(
+                            !cache
+                                .path()
+                                .join(fingerprint)
+                                .join("test-exclusion")
+                                .exists()
+                        );
+                    } else {
+                        let derived: Value =
+                            serde_json::from_slice(&fs::read(&derived_path).unwrap()).unwrap();
+                        assert_eq!(derived["schema"], 3);
+                        assert!(derived["analysis"].get("without_tests").is_some());
+                        if oid == &clean_oid {
+                            assert!(derived["analysis"]["without_tests"].is_null());
+                        } else {
+                            assert_eq!(
+                                derived["analysis"]["without_tests"]["functions"]
+                                    .as_array()
+                                    .unwrap()
+                                    .len(),
+                                1
+                            );
+                        }
+                        if !filtered {
+                            // Raw mode must neither read nor repair a corrupt derived record.
+                            fs::write(&derived_path, "invalid derived cache").unwrap();
+                            let raw_again = run(repo.path(), &args);
+                            assert!(raw_again.status.success());
+                            assert_eq!(raw_again.stdout, cold.stdout);
+                            assert_eq!(fs::read(&derived_path).unwrap(), b"invalid derived cache");
+                        }
+                    }
+                    assert_eq!(fs::read(raw_path).unwrap(), raw_bytes);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn derived_failures_are_explicit_and_failed_parses_never_create_derived_records() {
+    let repo = repository(&[
+        ("pkg/clean.rs", "fn production() {}\n"),
+        ("pkg/bad.rs", "#[test]\nfn broken("),
+    ]);
+    let cache = tempfile::tempdir().unwrap();
+    let args = [
+        "measure",
+        "--exclude-tests",
+        "--allow-partial",
+        "--format",
+        "json",
+        "--cache-dir",
+        cache.path().to_str().unwrap(),
+    ];
+    let report = successful_json(repo.path(), &args);
+    assert_eq!(report["snapshots"][0]["status"], "partial");
+    assert_eq!(report["snapshots"][0]["coverage"]["failed_files"], 1);
+    let fingerprint = report["metric"]["analyzer_fingerprint"].as_str().unwrap();
+    let bad_oid = git(repo.path(), &["rev-parse", "HEAD:pkg/bad.rs"]);
+    let clean_oid = git(repo.path(), &["rev-parse", "HEAD:pkg/clean.rs"]);
+    assert!(rust_cache_path(cache.path(), fingerprint, &bad_oid, false).exists());
+    assert!(!rust_cache_path(cache.path(), fingerprint, &bad_oid, true).exists());
+    assert_eq!(report, successful_json(repo.path(), &args));
+    let derived_path = rust_cache_path(cache.path(), fingerprint, &clean_oid, true);
+    fs::write(&derived_path, "{}").unwrap();
+    for command in commands() {
+        let mut arguments = command;
+        arguments.extend([
+            "--exclude-tests",
+            "--allow-partial",
+            "--format",
+            "json",
+            "--cache-dir",
+            cache.path().to_str().unwrap(),
+        ]);
+        let failure = run(repo.path(), &arguments);
+        assert_eq!(failure.status.code(), Some(1));
+        assert!(failure.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&failure.stderr).contains("Invalid cache"));
+    }
+    // A missing raw record must not silently overwrite an invalid derived record.
+    fs::remove_file(rust_cache_path(
+        cache.path(),
+        fingerprint,
+        &clean_oid,
+        false,
+    ))
+    .unwrap();
+    let failure = run(repo.path(), &args);
+    assert_eq!(failure.status.code(), Some(1));
+    assert_eq!(fs::read(derived_path).unwrap(), b"{}");
+}
+
 #[test]
 fn all_commands_apply_language_policies_without_changing_defaults() {
     let repo = repository(&[
@@ -137,7 +320,7 @@ fn all_commands_apply_language_policies_without_changing_defaults() {
 }
 
 #[test]
-fn inline_tests_recompute_all_commands_and_share_path_independent_raw_filtered_cache_views() {
+fn inline_tests_are_derived_on_demand_without_rewriting_path_independent_raw_records() {
     let javascript = format!(
         "import {{test as check}} from 'node:test';\nexport function production(x) {{\n if(x)work();\n check('case',()=>{{\n{} }});\n return x;\n}}\n",
         "  if(x)work();\n".repeat(10)
@@ -180,7 +363,14 @@ fn inline_tests_recompute_all_commands_and_share_path_independent_raw_filtered_c
     assert_eq!(raw["snapshots"][0]["complex_functions"], 8);
     let fingerprint = raw["metric"]["analyzer_fingerprint"].as_str().unwrap();
     let mut records = Vec::new();
-    let mut removed_lines = 0;
+    assert!(
+        !cache
+            .path()
+            .join(fingerprint)
+            .join("test-exclusion")
+            .exists()
+    );
+    let mut raw_lines = 0;
     for (extension, language) in [
         ("js", "javascript"),
         ("ts", "typescript"),
@@ -196,29 +386,17 @@ fn inline_tests_recompute_all_commands_and_share_path_independent_raw_filtered_c
         let path = cache
             .path()
             .join(fingerprint)
+            .join("raw")
             .join(language)
             .join(&oid[..2])
             .join(format!("{oid}.json"));
         let bytes = fs::read(&path).unwrap();
         let record: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(record["schema"], 2);
+        assert_eq!(record["schema"], 3);
         let analysis = &record["analysis"];
         assert_eq!(analysis["functions"].as_array().unwrap().len(), 2);
-        assert_eq!(
-            analysis["without_tests"]["functions"]
-                .as_array()
-                .unwrap()
-                .len(),
-            1
-        );
-        assert!(
-            !analysis["without_tests"]["regions"]
-                .as_array()
-                .unwrap()
-                .is_empty()
-        );
-        removed_lines += analysis["source_lines"].as_u64().unwrap()
-            - analysis["without_tests"]["source_lines"].as_u64().unwrap();
+        assert!(analysis.get("without_tests").is_none());
+        raw_lines += analysis["source_lines"].as_u64().unwrap();
         records.push((path, bytes));
     }
     for command in commands() {
@@ -251,7 +429,7 @@ fn inline_tests_recompute_all_commands_and_share_path_independent_raw_filtered_c
             assert_eq!(point["coverage"]["test_excluded_functions"], 6);
             assert_eq!(
                 point["coverage"]["test_excluded_source_lines"],
-                removed_lines
+                raw_lines - point["coverage"]["parsed_source_lines"].as_u64().unwrap()
             );
         }
         let mut args = command;
@@ -497,12 +675,14 @@ fn excluded_top_functions_and_cache_records_do_not_leak_into_reports() {
     let source_record = cache
         .path()
         .join(fingerprint)
+        .join("raw")
         .join("typescript")
         .join(&source_oid[..2])
         .join(format!("{source_oid}.json"));
     let test_record = cache
         .path()
         .join(fingerprint)
+        .join("raw")
         .join("typescript")
         .join(&test_oid[..2])
         .join(format!("{test_oid}.json"));

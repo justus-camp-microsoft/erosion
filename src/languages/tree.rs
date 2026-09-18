@@ -1,7 +1,9 @@
 use anyhow::{Context, Result, ensure};
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
+use std::marker::PhantomData;
 use tree_sitter::{Node, Parser};
 
+use super::{LanguageAdapter, LanguageTestPolicy};
 use crate::metrics::{
     FileAnalysis, FunctionMetrics, ParseDiagnostic, TestFilteredAnalysis, TestRegion,
 };
@@ -50,8 +52,135 @@ pub(super) trait SyntaxRules {
     fn validation_error(_node: Node<'_>) -> Option<&'static str> {
         None
     }
-    fn test_regions(_root: Node<'_>, _source: &[u8]) -> Vec<TestRegion> {
-        Vec::new()
+}
+
+pub(super) trait TestDetector: 'static {
+    fn new() -> Result<Self>
+    where
+        Self: Sized;
+    fn test_policy(&self) -> LanguageTestPolicy;
+    fn is_test_file(&self, path: &str) -> bool;
+    fn test_regions(&self, root: Node<'_>, source: &[u8]) -> Result<Vec<TestRegion>>;
+}
+
+pub(super) trait LanguageRules: SyntaxRules + 'static {
+    type Tests: TestDetector;
+}
+
+pub(super) struct AllCode;
+
+struct ExcludeTests<D>(D);
+
+pub(super) trait AnalysisPolicy<R: SyntaxRules> {
+    fn test_policy(&self) -> Option<LanguageTestPolicy>;
+    fn is_test_file(&self, path: &str) -> bool;
+    fn finish(
+        &self,
+        root: Node<'_>,
+        source: &[u8],
+        bom_bytes: usize,
+        raw: FileAnalysis,
+    ) -> Result<FileAnalysis>;
+}
+
+impl<R: SyntaxRules> AnalysisPolicy<R> for AllCode {
+    fn test_policy(&self) -> Option<LanguageTestPolicy> {
+        None
+    }
+
+    fn is_test_file(&self, _path: &str) -> bool {
+        false
+    }
+
+    fn finish(
+        &self,
+        _root: Node<'_>,
+        _source: &[u8],
+        _bom_bytes: usize,
+        raw: FileAnalysis,
+    ) -> Result<FileAnalysis> {
+        Ok(raw)
+    }
+}
+
+impl<R: LanguageRules> AnalysisPolicy<R> for ExcludeTests<R::Tests> {
+    fn test_policy(&self) -> Option<LanguageTestPolicy> {
+        Some(self.0.test_policy())
+    }
+
+    fn is_test_file(&self, path: &str) -> bool {
+        self.0.is_test_file(path)
+    }
+
+    fn finish(
+        &self,
+        root: Node<'_>,
+        source: &[u8],
+        bom_bytes: usize,
+        mut raw: FileAnalysis,
+    ) -> Result<FileAnalysis> {
+        let mut regions = normalize_regions(self.0.test_regions(root, source)?, source.len())?;
+        if !regions.is_empty() {
+            let filtered = measure::<R>(root, source, &regions)?;
+            ensure!(
+                filtered.parsed(),
+                "Test filtering changed syntax validation"
+            );
+            ensure!(
+                filtered.source_lines <= raw.source_lines
+                    && filtered.functions.len() <= raw.functions.len(),
+                "Test filtering increased measured source or function counts"
+            );
+            for region in &mut regions {
+                region.start_byte += bom_bytes;
+                region.end_byte += bom_bytes;
+            }
+            raw.without_tests = Some(TestFilteredAnalysis {
+                source_lines: filtered.source_lines,
+                functions: filtered.functions,
+                regions,
+            });
+        }
+        Ok(raw)
+    }
+}
+
+struct TreeSitterAdapter<R, P> {
+    parser: Parser,
+    policy: P,
+    rules: PhantomData<fn() -> R>,
+}
+
+impl<R: SyntaxRules, P: AnalysisPolicy<R>> LanguageAdapter for TreeSitterAdapter<R, P> {
+    fn test_policy(&self) -> Option<LanguageTestPolicy> {
+        self.policy.test_policy()
+    }
+
+    fn is_test_file(&self, path: &str) -> bool {
+        self.policy.is_test_file(path)
+    }
+
+    fn analyze(&mut self, source: &[u8]) -> Result<FileAnalysis> {
+        analyze::<R, P>(&mut self.parser, source, &self.policy)
+    }
+}
+
+pub(super) fn adapter<R: LanguageRules>(
+    parser: Parser,
+    exclude_tests: bool,
+) -> Result<Box<dyn LanguageAdapter>> {
+    if exclude_tests {
+        Ok(Box::new(TreeSitterAdapter::<R, _> {
+            parser,
+            policy: ExcludeTests(R::Tests::new()?),
+            rules: PhantomData,
+        }))
+    } else {
+        Ok(Box::new(TreeSitterAdapter::<R, _> {
+            parser,
+            policy: AllCode,
+            rules: PhantomData,
+        }))
     }
 }
 
@@ -80,7 +209,11 @@ pub(super) fn source_line(line: &[u8]) -> bool {
         .all(|byte| b"{}[]();,:".contains(byte))
 }
 
-pub(super) fn analyze<R: SyntaxRules>(parser: &mut Parser, source: &[u8]) -> Result<FileAnalysis> {
+pub(super) fn analyze<R: SyntaxRules, P: AnalysisPolicy<R>>(
+    parser: &mut Parser,
+    source: &[u8],
+    policy: &P,
+) -> Result<FileAnalysis> {
     let bom_bytes = if source.starts_with(b"\xef\xbb\xbf") {
         3
     } else {
@@ -112,28 +245,7 @@ pub(super) fn analyze<R: SyntaxRules>(parser: &mut Parser, source: &[u8]) -> Res
     let root = tree.root_node();
     analysis = measure::<R>(root, source, &[])?;
     if analysis.parsed() {
-        let mut regions = normalize_regions(R::test_regions(root, source), source.len())?;
-        if !regions.is_empty() {
-            let filtered = measure::<R>(root, source, &regions)?;
-            ensure!(
-                filtered.parsed(),
-                "Test filtering changed syntax validation"
-            );
-            ensure!(
-                filtered.source_lines <= analysis.source_lines
-                    && filtered.functions.len() <= analysis.functions.len(),
-                "Test filtering increased measured source or function counts"
-            );
-            for region in &mut regions {
-                region.start_byte += bom_bytes;
-                region.end_byte += bom_bytes;
-            }
-            analysis.without_tests = Some(TestFilteredAnalysis {
-                source_lines: filtered.source_lines,
-                functions: filtered.functions,
-                regions,
-            });
-        }
+        return policy.finish(root, source, bom_bytes, analysis);
     }
     Ok(analysis)
 }
@@ -308,7 +420,33 @@ mod tests {
                 .to_owned()
         }
 
-        fn test_regions(root: Node<'_>, source: &[u8]) -> Vec<TestRegion> {
+        fn validation_error(node: Node<'_>) -> Option<&'static str> {
+            (node.kind() == "debugger_statement").then_some("unsupported fixture syntax")
+        }
+    }
+
+    impl LanguageRules for MarkedFunctions {
+        type Tests = Self;
+    }
+
+    impl TestDetector for MarkedFunctions {
+        fn new() -> Result<Self> {
+            Ok(Self)
+        }
+
+        fn test_policy(&self) -> LanguageTestPolicy {
+            LanguageTestPolicy {
+                version: "fixture-v1",
+                path_patterns: &["*.test.js"],
+                syntax_rules: &["test_ functions"],
+            }
+        }
+
+        fn is_test_file(&self, path: &str) -> bool {
+            path.ends_with(".test.js")
+        }
+
+        fn test_regions(&self, root: Node<'_>, source: &[u8]) -> Result<Vec<TestRegion>> {
             let mut regions = Vec::new();
             let mut nodes = vec![root];
             while let Some(node) = nodes.pop() {
@@ -317,11 +455,7 @@ mod tests {
                 }
                 nodes.extend(node.named_children(&mut node.walk()));
             }
-            regions
-        }
-
-        fn validation_error(node: Node<'_>) -> Option<&'static str> {
-            (node.kind() == "debugger_statement").then_some("unsupported fixture syntax")
+            Ok(regions)
         }
     }
 
@@ -339,7 +473,9 @@ mod tests {
         let mut parser = parser();
         let tree = parser.parse(source, None).unwrap();
         let raw = measure::<MarkedFunctions>(tree.root_node(), source, &[]).unwrap();
-        let mut analyzed = analyze::<MarkedFunctions>(&mut parser, source).unwrap();
+        let mut analyzed =
+            analyze::<MarkedFunctions, _>(&mut parser, source, &ExcludeTests(MarkedFunctions))
+                .unwrap();
         let filtered = analyzed.without_tests.take().unwrap();
         assert_eq!(analyzed, raw);
         assert_eq!(raw.functions.len(), 2);
@@ -354,7 +490,12 @@ mod tests {
     #[test]
     fn byte_masking_preserves_same_line_production_and_original_blob_offsets() {
         let source = "\u{feff}function test_only(){if(x)work('\u{65e5}\u{672c}\u{8a9e}')} function production(){}\r\n";
-        let analyzed = analyze::<MarkedFunctions>(&mut parser(), source.as_bytes()).unwrap();
+        let analyzed = analyze::<MarkedFunctions, _>(
+            &mut parser(),
+            source.as_bytes(),
+            &ExcludeTests(MarkedFunctions),
+        )
+        .unwrap();
         assert_eq!(analyzed.physical_lines, 1);
         assert_eq!(analyzed.functions.len(), 2);
         let filtered = analyzed.without_tests.unwrap();
@@ -375,9 +516,10 @@ mod tests {
 
     #[test]
     fn wholly_test_source_has_zero_mass_without_hiding_parse_or_language_errors() {
-        let analyzed = analyze::<MarkedFunctions>(
+        let analyzed = analyze::<MarkedFunctions, _>(
             &mut parser(),
             b"function test_outer(){function test_inner(){if(x)work()}}\n",
+            &ExcludeTests(MarkedFunctions),
         )
         .unwrap();
         let filtered = analyzed.without_tests.unwrap();
@@ -385,17 +527,125 @@ mod tests {
         assert_eq!(filtered.source_lines, 0);
         assert_eq!(filtered.regions.len(), 1);
         for source in ["function test_bad(){if(}", "function test_bad(){debugger;}"] {
-            let analyzed = analyze::<MarkedFunctions>(&mut parser(), source.as_bytes()).unwrap();
+            let analyzed = analyze::<MarkedFunctions, _>(
+                &mut parser(),
+                source.as_bytes(),
+                &ExcludeTests(MarkedFunctions),
+            )
+            .unwrap();
             assert!(!analyzed.parsed());
             assert!(analyzed.functions.is_empty());
             assert!(analyzed.without_tests.is_none());
         }
         assert!(
-            analyze::<MarkedFunctions>(&mut parser(), b"function production(){}")
-                .unwrap()
-                .without_tests
-                .is_none()
+            analyze::<MarkedFunctions, _>(
+                &mut parser(),
+                b"function production(){}",
+                &ExcludeTests(MarkedFunctions),
+            )
+            .unwrap()
+            .without_tests
+            .is_none()
         );
+    }
+
+    struct UnfinishedRules<const PANIC_ON_CONSTRUCTION: bool>;
+    struct UnfinishedDetector<const PANIC_ON_CONSTRUCTION: bool>;
+
+    impl<const P: bool> SyntaxRules for UnfinishedRules<P> {
+        fn callable(node: Node<'_>) -> bool {
+            MarkedFunctions::callable(node)
+        }
+
+        fn decisions(node: Node<'_>) -> u64 {
+            MarkedFunctions::decisions(node)
+        }
+
+        fn name(node: Node<'_>, source: &[u8]) -> String {
+            MarkedFunctions::name(node, source)
+        }
+    }
+
+    impl<const P: bool> LanguageRules for UnfinishedRules<P> {
+        type Tests = UnfinishedDetector<P>;
+    }
+
+    impl<const P: bool> TestDetector for UnfinishedDetector<P> {
+        fn new() -> Result<Self> {
+            assert!(!P, "detector construction");
+            Ok(Self)
+        }
+
+        fn test_policy(&self) -> LanguageTestPolicy {
+            unimplemented!("detector policy")
+        }
+
+        fn is_test_file(&self, _path: &str) -> bool {
+            unimplemented!("detector path classification")
+        }
+
+        fn test_regions(&self, _root: Node<'_>, _source: &[u8]) -> Result<Vec<TestRegion>> {
+            unimplemented!("detector syntax classification")
+        }
+    }
+
+    #[test]
+    fn raw_adapter_never_constructs_or_calls_an_unfinished_detector() {
+        let mut adapter = adapter::<UnfinishedRules<true>>(parser(), false).unwrap();
+        assert!(adapter.test_policy().is_none());
+        assert!(!adapter.is_test_file("example.test.js"));
+        let analysis = adapter
+            .analyze(b"function production(){} function test_case(){if(x)work()}")
+            .unwrap();
+        assert!(analysis.parsed());
+        assert_eq!(analysis.functions.len(), 2);
+        assert!(analysis.without_tests.is_none());
+        for source in [b"function test_broken({".as_slice(), b"\xff"] {
+            let analysis = adapter.analyze(source).unwrap();
+            assert!(!analysis.parsed());
+            assert!(analysis.without_tests.is_none());
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "detector construction")]
+    fn exclusion_constructs_the_required_detector() {
+        let _adapter = adapter::<UnfinishedRules<true>>(parser(), true).unwrap();
+    }
+
+    #[test]
+    #[should_panic(expected = "detector policy")]
+    fn exclusion_delegates_policy_to_the_detector() {
+        adapter::<UnfinishedRules<false>>(parser(), true)
+            .unwrap()
+            .test_policy();
+    }
+
+    #[test]
+    #[should_panic(expected = "detector path classification")]
+    fn exclusion_delegates_paths_to_the_detector() {
+        adapter::<UnfinishedRules<false>>(parser(), true)
+            .unwrap()
+            .is_test_file("example.js");
+    }
+
+    #[test]
+    #[should_panic(expected = "detector syntax classification")]
+    fn exclusion_delegates_valid_syntax_to_the_detector() {
+        adapter::<UnfinishedRules<false>>(parser(), true)
+            .unwrap()
+            .analyze(b"function example(){}")
+            .unwrap();
+    }
+
+    #[test]
+    fn exclusion_does_not_classify_failed_parses() {
+        let mut adapter = adapter::<UnfinishedRules<false>>(parser(), true).unwrap();
+        for source in [b"function test_broken({".as_slice(), b"\xff"] {
+            let analysis = adapter.analyze(source).unwrap();
+            assert!(!analysis.parsed());
+            assert!(analysis.without_tests.is_none());
+        }
     }
 
     #[test]

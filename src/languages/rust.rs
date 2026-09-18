@@ -5,9 +5,9 @@ use tree_sitter::{Node, Parser};
 
 use super::{
     LanguageAdapter, LanguageTestPolicy,
-    tree::{self, SyntaxRules},
+    tree::{self, LanguageRules, SyntaxRules, TestDetector},
 };
-use crate::metrics::{FileAnalysis, TestRegion};
+use crate::metrics::TestRegion;
 
 const TEST_PATHS: &[&str] = &["**/tests/**", "**/tests.rs"];
 const TEST_SYNTAX: &[&str] = &[
@@ -27,56 +27,46 @@ const DECISIONS: &[&str] = &[
     "loop_expression",
 ];
 
-pub struct RustAdapter {
-    parser: Parser,
+struct RustRules;
+
+struct RustTestDetector {
     test_paths: tree::TestPaths,
 }
 
-impl RustAdapter {
-    pub fn new() -> Result<Self> {
-        let grammar: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
-        for kind in DECISIONS.iter().chain(
-            [
-                "function_item",
-                "closure_expression",
-                "match_arm",
-                "let_declaration",
-                "binary_expression",
-                "line_comment",
-                "block_comment",
-                "attribute_item",
-                "inner_attribute_item",
-                "attribute",
-                "token_tree",
-                "use_declaration",
-                "use_as_clause",
-                "scoped_use_list",
-                "use_list",
-                "use_wildcard",
-                "extern_crate_declaration",
-            ]
-            .iter(),
-        ) {
-            ensure!(
-                grammar.id_for_node_kind(kind, true) != 0,
-                "Rust grammar missing {kind}"
-            );
-        }
-        for field in ["body", "name", "operator", "pattern", "alternative"] {
-            ensure!(
-                grammar.field_id_for_name(field).is_some(),
-                "Rust grammar missing {field} field"
-            );
-        }
-        let mut parser = Parser::new();
-        parser
-            .set_language(&grammar)
-            .context("Loading Rust grammar")?;
-        Ok(Self {
-            parser,
-            test_paths: tree::TestPaths::new(TEST_PATHS)?,
-        })
+pub fn adapter(exclude_tests: bool) -> Result<Box<dyn LanguageAdapter>> {
+    tree::adapter::<RustRules>(parser()?, exclude_tests)
+}
+
+fn parser() -> Result<Parser> {
+    let grammar: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+    for kind in DECISIONS.iter().chain(
+        [
+            "function_item",
+            "closure_expression",
+            "match_arm",
+            "let_declaration",
+            "binary_expression",
+            "line_comment",
+            "block_comment",
+        ]
+        .iter(),
+    ) {
+        ensure!(
+            grammar.id_for_node_kind(kind, true) != 0,
+            "Rust grammar missing {kind}"
+        );
     }
+    for field in ["body", "name", "operator", "pattern", "alternative"] {
+        ensure!(
+            grammar.field_id_for_name(field).is_some(),
+            "Rust grammar missing {field} field"
+        );
+    }
+    let mut parser = Parser::new();
+    parser
+        .set_language(&grammar)
+        .context("Loading Rust grammar")?;
+    Ok(parser)
 }
 
 fn text<'s>(node: Node<'_>, source: &'s [u8]) -> &'s str {
@@ -663,7 +653,7 @@ fn wildcard_match_arm(node: Node<'_>) -> bool {
     }
 }
 
-impl SyntaxRules for RustAdapter {
+impl SyntaxRules for RustRules {
     fn callable(node: Node<'_>) -> bool {
         matches!(node.kind(), "function_item" | "closure_expression")
             && node.child_by_field_name("body").is_some()
@@ -699,8 +689,38 @@ impl SyntaxRules for RustAdapter {
     fn ignored(node: Node<'_>, _source: &[u8]) -> bool {
         matches!(node.kind(), "line_comment" | "block_comment")
     }
+}
 
-    fn test_regions(root: Node<'_>, source: &[u8]) -> Vec<TestRegion> {
+impl LanguageRules for RustRules {
+    type Tests = RustTestDetector;
+}
+
+impl TestDetector for RustTestDetector {
+    fn new() -> Result<Self> {
+        let grammar: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        for kind in [
+            "attribute_item",
+            "inner_attribute_item",
+            "attribute",
+            "token_tree",
+            "use_declaration",
+            "use_as_clause",
+            "scoped_use_list",
+            "use_list",
+            "use_wildcard",
+            "extern_crate_declaration",
+        ] {
+            ensure!(
+                grammar.id_for_node_kind(kind, true) != 0,
+                "Rust grammar missing {kind}"
+            );
+        }
+        Ok(Self {
+            test_paths: tree::TestPaths::new(TEST_PATHS)?,
+        })
+    }
+
+    fn test_regions(&self, root: Node<'_>, source: &[u8]) -> Result<Vec<TestRegion>> {
         let mut regions = Vec::new();
         let mut scopes = Vec::new();
         let mut pending = vec![(root, None)];
@@ -771,11 +791,9 @@ impl SyntaxRules for RustAdapter {
             pending.extend(node.named_children(&mut cursor).map(|child| (child, scope)));
             pending[start..].reverse();
         }
-        regions
+        Ok(regions)
     }
-}
 
-impl LanguageAdapter for RustAdapter {
     fn test_policy(&self) -> LanguageTestPolicy {
         LanguageTestPolicy {
             version: "rust-tests-v1",
@@ -787,21 +805,15 @@ impl LanguageAdapter for RustAdapter {
     fn is_test_file(&self, path: &str) -> bool {
         self.test_paths.matches(path)
     }
-
-    fn analyze(&mut self, source: &[u8]) -> Result<FileAnalysis> {
-        tree::analyze::<Self>(&mut self.parser, source)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::FileAnalysis;
 
     fn parse(source: &str) -> FileAnalysis {
-        let result = RustAdapter::new()
-            .unwrap()
-            .analyze(source.as_bytes())
-            .unwrap();
+        let result = adapter(true).unwrap().analyze(source.as_bytes()).unwrap();
         assert!(result.parsed(), "{:?}", result.diagnostics);
         result
     }
@@ -816,11 +828,28 @@ mod tests {
     }
 
     #[test]
+    fn raw_mode_keeps_test_code_without_a_filtered_view() {
+        let source = "\u{feff}fn production() {\r\n    #[cfg(test)] let helper = || { if ready() { work(); } };\r\n    work();\r\n}\r\n#[test]\r\nfn check() { assert!(ready()); }\r\n";
+        let mut raw_adapter = adapter(false).unwrap();
+        assert!(raw_adapter.test_policy().is_none());
+        assert!(!raw_adapter.is_test_file("tests/example.rs"));
+        let raw = raw_adapter.analyze(source.as_bytes()).unwrap();
+        assert!(raw.parsed(), "{:?}", raw.diagnostics);
+        assert!(raw.without_tests.is_none());
+        let mut filtered = parse(source);
+        let without_tests = filtered.without_tests.take().expect("recognized tests");
+        assert!(without_tests.functions.len() < raw.functions.len());
+        assert!(without_tests.source_lines < raw.source_lines);
+        assert_eq!(raw, filtered);
+    }
+
+    #[test]
     fn rust_owned_path_policy() {
-        let adapter = RustAdapter::new().unwrap();
-        assert_eq!(adapter.test_policy().path_patterns, TEST_PATHS);
-        assert_eq!(adapter.test_policy().syntax_rules, TEST_SYNTAX);
-        assert_eq!(adapter.test_policy().version, "rust-tests-v1");
+        let adapter = adapter(true).unwrap();
+        let policy = adapter.test_policy().unwrap();
+        assert_eq!(policy.path_patterns, TEST_PATHS);
+        assert_eq!(policy.syntax_rules, TEST_SYNTAX);
+        assert_eq!(policy.version, "rust-tests-v1");
         for path in [
             "tests.rs",
             "src/tests.rs",
@@ -1164,7 +1193,7 @@ mod tests {
                       fn production() { let test = || 1; assert!(test() == 1); }\n\
                       macro_rules! generate { () => { #[test] fn generated() {} } }\n\
                       generate!();";
-        let mut adapter = RustAdapter::new().unwrap();
+        let mut adapter = adapter(true).unwrap();
         let before = adapter.analyze(source.as_bytes()).unwrap();
         assert!(before.parsed());
         assert!(before.without_tests.is_none());
@@ -1182,10 +1211,7 @@ mod tests {
             "#[tokio::test] async fn broken() {",
             "#[cfg_attr(all(), test)] fn broken() { let = 1; }",
         ] {
-            let file = RustAdapter::new()
-                .unwrap()
-                .analyze(source.as_bytes())
-                .unwrap();
+            let file = adapter(true).unwrap().analyze(source.as_bytes()).unwrap();
             assert!(!file.parsed(), "{source}");
             assert!(!file.diagnostics.is_empty(), "{source}");
             assert!(file.functions.is_empty(), "{source}");
@@ -1212,10 +1238,7 @@ mod tests {
         );
         assert_eq!(file.functions[0].complexity, 3);
         assert_eq!(file.functions[0].source_lines, 3);
-        let bad = RustAdapter::new()
-            .unwrap()
-            .analyze(b"fn broken( {")
-            .unwrap();
+        let bad = adapter(false).unwrap().analyze(b"fn broken( {").unwrap();
         assert!(!bad.parsed());
         assert!(bad.functions.is_empty());
     }

@@ -5,9 +5,9 @@ use tree_sitter::{Node, Parser};
 
 use super::{
     LanguageAdapter, LanguageTestPolicy,
-    tree::{self, SyntaxRules},
+    tree::{self, LanguageRules, SyntaxRules, TestDetector},
 };
-use crate::metrics::{FileAnalysis, TestRegion};
+use crate::metrics::TestRegion;
 
 const TEST_PATHS: &[&str] = &["**/test/**", "**/tests/**", "**/*_test.gleam"];
 const TEST_SYNTAX: &[&str] = &[
@@ -19,74 +19,47 @@ const TEST_SYNTAX: &[&str] = &[
     "gleeunit exposes no callback-registration or fixture DSL. Custom frameworks, dynamic/local runner aliases, cross-file wrappers and ambiguous bindings remain included; target-specific duplicate bindings are not guessed.",
 ];
 
-pub struct GleamAdapter {
-    parser: Parser,
+struct GleamRules;
+
+struct GleamTestDetector {
     test_paths: tree::TestPaths,
 }
 
-impl GleamAdapter {
-    pub fn new() -> Result<Self> {
-        let grammar: tree_sitter::Language = tree_sitter_gleam::LANGUAGE.into();
-        for kind in [
-            "function",
-            "anonymous_function",
-            "case_clause",
-            "case_clause_patterns",
-            "case_clause_pattern",
-            "binary_expression",
-            "assert",
-            "let_assert",
-            "module_comment",
-            "statement_comment",
-            "comment",
-            "import",
-            "unqualified_import",
-            "function_call",
-            "function_parameter",
-            "argument",
-            "visibility_modifier",
-            "field_access",
-            "constant",
-            "attribute",
-        ] {
-            ensure!(
-                grammar.id_for_node_kind(kind, true) != 0,
-                "Gleam grammar missing {kind}"
-            );
-        }
-        for field in [
-            "body",
-            "name",
-            "operator",
-            "patterns",
-            "guard",
-            "module",
-            "imports",
-            "alias",
-            "parameters",
-            "arguments",
-            "function",
-            "record",
-            "field",
-            "pattern",
-            "value",
-            "assignments",
-            "right",
-        ] {
-            ensure!(
-                grammar.field_id_for_name(field).is_some(),
-                "Gleam grammar missing {field} field"
-            );
-        }
-        let mut parser = Parser::new();
-        parser
-            .set_language(&grammar)
-            .context("Loading Gleam grammar")?;
-        Ok(Self {
-            parser,
-            test_paths: tree::TestPaths::new(TEST_PATHS)?,
-        })
+pub fn adapter(exclude_tests: bool) -> Result<Box<dyn LanguageAdapter>> {
+    tree::adapter::<GleamRules>(parser()?, exclude_tests)
+}
+
+fn parser() -> Result<Parser> {
+    let grammar: tree_sitter::Language = tree_sitter_gleam::LANGUAGE.into();
+    for kind in [
+        "function",
+        "anonymous_function",
+        "case_clause",
+        "case_clause_patterns",
+        "case_clause_pattern",
+        "binary_expression",
+        "assert",
+        "let_assert",
+        "module_comment",
+        "statement_comment",
+        "comment",
+    ] {
+        ensure!(
+            grammar.id_for_node_kind(kind, true) != 0,
+            "Gleam grammar missing {kind}"
+        );
     }
+    for field in ["body", "name", "operator", "patterns", "guard"] {
+        ensure!(
+            grammar.field_id_for_name(field).is_some(),
+            "Gleam grammar missing {field} field"
+        );
+    }
+    let mut parser = Parser::new();
+    parser
+        .set_language(&grammar)
+        .context("Loading Gleam grammar")?;
+    Ok(parser)
 }
 
 fn text<'a>(node: Node<'_>, source: &'a [u8]) -> &'a str {
@@ -475,7 +448,7 @@ impl<'tree, 'source> TestDiscovery<'tree, 'source> {
                                 && zero_parameters(*function)
                                 && named_children(body)
                                     .iter()
-                                    .filter(|child| !GleamAdapter::ignored(**child, self.source))
+                                    .filter(|child| !GleamRules::ignored(**child, self.source))
                                     .count()
                                     == 1
                                 && !has_external_attribute(*function, self.source)
@@ -596,7 +569,7 @@ fn irrefutable_clause(node: Node<'_>) -> bool {
     true
 }
 
-impl SyntaxRules for GleamAdapter {
+impl SyntaxRules for GleamRules {
     fn callable(node: Node<'_>) -> bool {
         matches!(node.kind(), "function" | "anonymous_function")
             && node.child_by_field_name("body").is_some()
@@ -626,13 +599,55 @@ impl SyntaxRules for GleamAdapter {
             "module_comment" | "statement_comment" | "comment"
         )
     }
-
-    fn test_regions(root: Node<'_>, source: &[u8]) -> Vec<TestRegion> {
-        TestDiscovery::new(root, source).discover(root)
-    }
 }
 
-impl LanguageAdapter for GleamAdapter {
+impl LanguageRules for GleamRules {
+    type Tests = GleamTestDetector;
+}
+
+impl TestDetector for GleamTestDetector {
+    fn new() -> Result<Self> {
+        let grammar: tree_sitter::Language = tree_sitter_gleam::LANGUAGE.into();
+        for kind in [
+            "import",
+            "unqualified_import",
+            "function_call",
+            "function_parameter",
+            "argument",
+            "visibility_modifier",
+            "field_access",
+            "constant",
+            "attribute",
+        ] {
+            ensure!(
+                grammar.id_for_node_kind(kind, true) != 0,
+                "Gleam grammar missing {kind}"
+            );
+        }
+        for field in [
+            "module",
+            "imports",
+            "alias",
+            "parameters",
+            "arguments",
+            "function",
+            "record",
+            "field",
+            "pattern",
+            "value",
+            "assignments",
+            "right",
+        ] {
+            ensure!(
+                grammar.field_id_for_name(field).is_some(),
+                "Gleam grammar missing {field} field"
+            );
+        }
+        Ok(Self {
+            test_paths: tree::TestPaths::new(TEST_PATHS)?,
+        })
+    }
+
     fn test_policy(&self) -> LanguageTestPolicy {
         LanguageTestPolicy {
             version: "gleam-tests-v1",
@@ -645,40 +660,46 @@ impl LanguageAdapter for GleamAdapter {
         self.test_paths.matches(path)
     }
 
-    fn analyze(&mut self, source: &[u8]) -> Result<FileAnalysis> {
-        tree::analyze::<Self>(&mut self.parser, source)
+    fn test_regions(&self, root: Node<'_>, source: &[u8]) -> Result<Vec<TestRegion>> {
+        Ok(TestDiscovery::new(root, source).discover(root))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::FileAnalysis;
 
     struct RawGleam;
 
     impl SyntaxRules for RawGleam {
         fn callable(node: Node<'_>) -> bool {
-            GleamAdapter::callable(node)
+            GleamRules::callable(node)
         }
 
         fn decisions(node: Node<'_>) -> u64 {
-            GleamAdapter::decisions(node)
+            GleamRules::decisions(node)
         }
 
         fn name(node: Node<'_>, source: &[u8]) -> String {
-            GleamAdapter::name(node, source)
+            GleamRules::name(node, source)
         }
 
         fn ignored(node: Node<'_>, source: &[u8]) -> bool {
-            GleamAdapter::ignored(node, source)
+            GleamRules::ignored(node, source)
         }
     }
 
     fn parse(source: &str) -> FileAnalysis {
-        let mut adapter = GleamAdapter::new().unwrap();
-        let result = adapter.analyze(source.as_bytes()).unwrap();
+        let result = adapter(true).unwrap().analyze(source.as_bytes()).unwrap();
         assert!(result.parsed(), "{:?}", result.diagnostics);
-        let raw = tree::analyze::<RawGleam>(&mut adapter.parser, source.as_bytes()).unwrap();
+        let raw =
+            tree::analyze::<RawGleam, _>(&mut parser().unwrap(), source.as_bytes(), &tree::AllCode)
+                .unwrap();
+        assert_eq!(
+            adapter(false).unwrap().analyze(source.as_bytes()).unwrap(),
+            raw
+        );
         let mut unfiltered = result.clone();
         unfiltered.without_tests = None;
         assert_eq!(unfiltered, raw, "test detection changed raw analysis");
@@ -696,11 +717,28 @@ mod tests {
     }
 
     #[test]
+    fn raw_mode_keeps_test_code_without_a_filtered_view() {
+        let source = "\u{feff}import gleeunit\r\npub fn production() { 1 }\r\npub fn example_test() { assert True }\r\npub fn main() { gleeunit.main() }\r\n";
+        let mut raw_adapter = adapter(false).unwrap();
+        assert!(raw_adapter.test_policy().is_none());
+        assert!(!raw_adapter.is_test_file("tests/example_test.gleam"));
+        let raw = raw_adapter.analyze(source.as_bytes()).unwrap();
+        assert!(raw.parsed(), "{:?}", raw.diagnostics);
+        assert!(raw.without_tests.is_none());
+        let mut filtered = parse(source);
+        let without_tests = filtered.without_tests.take().expect("recognized tests");
+        assert!(without_tests.functions.len() < raw.functions.len());
+        assert!(without_tests.source_lines < raw.source_lines);
+        assert_eq!(raw, filtered);
+    }
+
+    #[test]
     fn language_owned_path_policy_is_component_bounded_and_case_sensitive() {
-        let adapter = GleamAdapter::new().unwrap();
-        assert_eq!(adapter.test_policy().version, "gleam-tests-v1");
-        assert_eq!(adapter.test_policy().path_patterns, TEST_PATHS);
-        assert_eq!(adapter.test_policy().syntax_rules, TEST_SYNTAX);
+        let adapter = adapter(true).unwrap();
+        let policy = adapter.test_policy().unwrap();
+        assert_eq!(policy.version, "gleam-tests-v1");
+        assert_eq!(policy.path_patterns, TEST_PATHS);
+        assert_eq!(policy.syntax_rules, TEST_SYNTAX);
         for path in [
             "test/helpers.gleam",
             "tests/fixtures/data.gleam",
@@ -1125,7 +1163,7 @@ pub fn production() {
             b"import gleeunit\npub fn main() { gleeunit.main( }",
             b"pub fn invalid_test() { assert \xff }",
         ] {
-            let file = GleamAdapter::new().unwrap().analyze(source).unwrap();
+            let file = adapter(true).unwrap().analyze(source).unwrap();
             assert!(!file.parsed());
             assert!(!file.diagnostics.is_empty());
             assert!(file.functions.is_empty());
@@ -1152,10 +1190,7 @@ pub fn production() {
         );
         assert_eq!(file.functions[0].complexity, 3);
         assert_eq!(file.functions[0].source_lines, 4);
-        let bad = GleamAdapter::new()
-            .unwrap()
-            .analyze(b"fn broken( {")
-            .unwrap();
+        let bad = adapter(false).unwrap().analyze(b"fn broken( {").unwrap();
         assert!(!bad.parsed());
         assert!(bad.functions.is_empty());
     }

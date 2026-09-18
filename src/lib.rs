@@ -7,7 +7,7 @@ pub mod metrics;
 pub mod modules;
 pub mod output;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -19,7 +19,10 @@ use config::{Config, Scope};
 use git::{BlobReader, Commit, Repository, TreeEntry};
 use history::Checkpoint;
 use languages::{Language, LanguageAdapter, TestExclusionPolicy};
-use metrics::{COMPLEXITY_THRESHOLD, FunctionMetrics, METRIC_VERSION, ParseDiagnostic, Sum};
+use metrics::{
+    COMPLEXITY_THRESHOLD, FunctionMetrics, METRIC_VERSION, ParseDiagnostic, Sum,
+    TestExclusionAnalysis,
+};
 
 #[derive(Default, Debug, Serialize)]
 pub struct LanguageCoverage {
@@ -218,6 +221,7 @@ pub struct Analyzer {
     pub cache: Cache,
     adapters: HashMap<Language, Box<dyn LanguageAdapter>>,
     test_exclusion: Option<TestExclusionPolicy>,
+    test_fingerprints: HashMap<Language, String>,
 }
 
 impl Analyzer {
@@ -226,14 +230,20 @@ impl Analyzer {
             cache,
             adapters: HashMap::new(),
             test_exclusion: None,
+            test_fingerprints: HashMap::new(),
         }
     }
 
     pub fn exclude_tests(mut self) -> Result<Self> {
         let mut policies = BTreeMap::new();
         for language in Language::ALL {
-            let adapter = languages::adapter(language)?;
-            policies.insert(language.id().to_owned(), adapter.test_policy());
+            let adapter = languages::adapter(language, true)?;
+            let policy = adapter
+                .test_policy()
+                .context("Missing language test policy")?;
+            self.test_fingerprints
+                .insert(language, policy.fingerprint()?);
+            policies.insert(language.id().to_owned(), policy);
             self.adapters.insert(language, adapter);
         }
         self.test_exclusion = Some(TestExclusionPolicy {
@@ -328,30 +338,74 @@ impl Analyzer {
             .entry(language.id().to_owned())
             .or_default();
         language_coverage.selected_files += 1;
-        let analysis = match self.cache.get(language, &entry.oid)? {
-            Some(cached) => cached,
-            None => {
-                let commit = snapshot
-                    .commit
-                    .as_ref()
-                    .context("Missing snapshot commit")?;
-                let source = reader
-                    .read(&entry.oid)
-                    .with_context(|| format!("Reading {:?} at {}", entry.path, commit.sha))?;
-                if let std::collections::hash_map::Entry::Vacant(slot) =
-                    self.adapters.entry(language)
-                {
-                    slot.insert(languages::adapter(language)?);
-                }
-                let parsed = self
-                    .adapters
-                    .get_mut(&language)
-                    .context("Missing language adapter")?
-                    .analyze(&source)
-                    .with_context(|| format!("Analyzing {:?}", entry.path))?;
-                self.cache.insert(language, &entry.oid, parsed)?
-            }
+        let mut analysis = self.cache.get(language, &entry.oid)?;
+        let policy = self.test_fingerprints.get(&language);
+        let mut exclusion = match policy {
+            Some(policy) if analysis.as_ref().is_none_or(|raw| raw.parsed()) => self
+                .cache
+                .get_test_exclusion(language, &entry.oid, policy)?,
+            _ => None,
         };
+        if analysis.is_none()
+            || (policy.is_some()
+                && analysis.as_ref().is_some_and(|raw| raw.parsed())
+                && exclusion.is_none())
+        {
+            if analysis.is_some() {
+                // A raw hit still needs source analysis when the derived view is absent.
+                self.cache.misses += 1;
+            }
+            let commit = snapshot
+                .commit
+                .as_ref()
+                .context("Missing snapshot commit")?;
+            let source = reader
+                .read(&entry.oid)
+                .with_context(|| format!("Reading {:?} at {}", entry.path, commit.sha))?;
+            if let std::collections::hash_map::Entry::Vacant(slot) = self.adapters.entry(language) {
+                slot.insert(languages::adapter(language, policy.is_some())?);
+            }
+            let mut parsed = self
+                .adapters
+                .get_mut(&language)
+                .context("Missing language adapter")?
+                .analyze(&source)
+                .with_context(|| format!("Analyzing {:?}", entry.path))?;
+            let derived = policy.map(|policy| {
+                (
+                    policy,
+                    TestExclusionAnalysis {
+                        without_tests: parsed.without_tests.take(),
+                    },
+                )
+            });
+            if let Some(raw) = &analysis {
+                ensure!(
+                    **raw == parsed,
+                    "Raw analysis disagrees with cached data for {:?}; remove it or use --no-cache",
+                    entry.path
+                );
+            } else {
+                analysis = Some(self.cache.insert(language, &entry.oid, parsed)?);
+            }
+            if let Some((policy, derived)) = derived
+                && analysis.as_ref().is_some_and(|raw| raw.parsed())
+            {
+                if let Some(cached) = &exclusion {
+                    ensure!(
+                        **cached == derived,
+                        "Test exclusion disagrees with cached data for {:?}; remove it or use --no-cache",
+                        entry.path
+                    );
+                } else {
+                    exclusion = Some(
+                        self.cache
+                            .insert_test_exclusion(language, &entry.oid, policy, derived)?,
+                    );
+                }
+            }
+        }
+        let analysis = analysis.context("Missing raw analysis")?;
         if !analysis.parsed() {
             snapshot.coverage.failed_files += 1;
             snapshot.coverage.failed_physical_lines += analysis.physical_lines;
@@ -366,10 +420,9 @@ impl Analyzer {
         }
         snapshot.coverage.parsed_files += 1;
         snapshot.coverage.parsed_physical_lines += analysis.physical_lines;
-        let filtered = self
-            .test_exclusion
+        let filtered = exclusion
             .as_ref()
-            .and(analysis.without_tests.as_ref());
+            .and_then(|analysis| analysis.without_tests.as_ref());
         let (source_lines, functions) = if let Some(filtered) = filtered {
             *snapshot
                 .coverage

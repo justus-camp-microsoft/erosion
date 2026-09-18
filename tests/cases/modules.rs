@@ -601,12 +601,13 @@ fn changing_grouping_reuses_blob_cache_and_cache_errors_are_not_partial() {
     let record = cache
         .path()
         .join(whole["metric"]["analyzer_fingerprint"].as_str().unwrap())
+        .join("raw")
         .join("typescript")
         .join(&oid[..2])
         .join(format!("{oid}.json"));
     let bytes = fs::read(&record).unwrap();
     let cached: Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(cached["schema"], 2);
+    assert_eq!(cached["schema"], 3);
     assert_eq!(cached["oid"], oid);
     assert!(cached.get("grouping").is_none());
     fs::write(record, "{}").unwrap();

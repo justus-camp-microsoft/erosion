@@ -2,9 +2,9 @@ use anyhow::{Context, Result, bail, ensure};
 use std::collections::{HashMap, HashSet};
 use tree_sitter::{Node, Parser};
 
-use super::tree::{self, SyntaxRules};
+use super::tree::{self, LanguageRules, SyntaxRules, TestDetector};
 use super::{Language, LanguageAdapter, LanguageTestPolicy};
-use crate::metrics::{FileAnalysis, TestRegion};
+use crate::metrics::TestRegion;
 
 const TEST_PATHS: &[&str] = &[
     "**/test/**",
@@ -36,45 +36,45 @@ const DECISIONS: &[&str] = &[
     "while_statement",
 ];
 
-pub struct JavaScriptAdapter {
-    parser: Parser,
+struct JavaScriptRules;
+
+struct JavaScriptTestDetector {
     test_paths: tree::TestPaths,
 }
 
-impl JavaScriptAdapter {
-    pub fn new(language: Language) -> Result<Self> {
-        let grammar: tree_sitter::Language = match language {
-            Language::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
-            Language::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-            Language::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
-            _ => bail!("JavaScript adapter does not support {}", language.id()),
-        };
-        for kind in CALLABLES
-            .iter()
-            .chain(DECISIONS)
-            .chain(["binary_expression", "comment"].iter())
-        {
-            ensure!(
-                grammar.id_for_node_kind(kind, true) != 0,
-                "Grammar contract changed: {} has no {kind}",
-                language.id()
-            );
-        }
-        for field in ["body", "operator"] {
-            ensure!(
-                grammar.field_id_for_name(field).is_some(),
-                "Grammar missing {field} field"
-            );
-        }
-        let mut parser = Parser::new();
-        parser
-            .set_language(&grammar)
-            .context("Loading bundled grammar")?;
-        Ok(Self {
-            parser,
-            test_paths: tree::TestPaths::new(TEST_PATHS)?,
-        })
+pub fn adapter(language: Language, exclude_tests: bool) -> Result<Box<dyn LanguageAdapter>> {
+    tree::adapter::<JavaScriptRules>(parser(language)?, exclude_tests)
+}
+
+fn parser(language: Language) -> Result<Parser> {
+    let grammar: tree_sitter::Language = match language {
+        Language::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
+        Language::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        Language::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
+        _ => bail!("JavaScript adapter does not support {}", language.id()),
+    };
+    for kind in CALLABLES
+        .iter()
+        .chain(DECISIONS)
+        .chain(["binary_expression", "comment"].iter())
+    {
+        ensure!(
+            grammar.id_for_node_kind(kind, true) != 0,
+            "Grammar contract changed: {} has no {kind}",
+            language.id()
+        );
     }
+    for field in ["body", "operator"] {
+        ensure!(
+            grammar.field_id_for_name(field).is_some(),
+            "Grammar missing {field} field"
+        );
+    }
+    let mut parser = Parser::new();
+    parser
+        .set_language(&grammar)
+        .context("Loading bundled grammar")?;
+    Ok(parser)
 }
 
 fn name(node: Node<'_>, source: &[u8]) -> String {
@@ -100,11 +100,7 @@ fn own_decisions(node: Node<'_>) -> u64 {
         )
 }
 
-impl SyntaxRules for JavaScriptAdapter {
-    fn test_regions(root: Node<'_>, source: &[u8]) -> Vec<TestRegion> {
-        TestBindings::new(root, source).regions()
-    }
-
+impl SyntaxRules for JavaScriptRules {
     fn callable(node: Node<'_>) -> bool {
         CALLABLES.contains(&node.kind()) && node.child_by_field_name("body").is_some()
     }
@@ -118,7 +114,17 @@ impl SyntaxRules for JavaScriptAdapter {
     }
 }
 
-impl LanguageAdapter for JavaScriptAdapter {
+impl LanguageRules for JavaScriptRules {
+    type Tests = JavaScriptTestDetector;
+}
+
+impl TestDetector for JavaScriptTestDetector {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            test_paths: tree::TestPaths::new(TEST_PATHS)?,
+        })
+    }
+
     fn test_policy(&self) -> LanguageTestPolicy {
         LanguageTestPolicy {
             version: "javascript-tests-v1",
@@ -138,8 +144,8 @@ impl LanguageAdapter for JavaScriptAdapter {
         self.test_paths.matches(path)
     }
 
-    fn analyze(&mut self, source: &[u8]) -> Result<FileAnalysis> {
-        tree::analyze::<Self>(&mut self.parser, source)
+    fn test_regions(&self, root: Node<'_>, source: &[u8]) -> Result<Vec<TestRegion>> {
+        Ok(TestBindings::new(root, source).regions())
     }
 }
 
@@ -1082,9 +1088,10 @@ impl<'tree, 'source> TestBindings<'tree, 'source> {
 mod tests {
     use super::tree::source_line;
     use super::*;
+    use crate::metrics::FileAnalysis;
 
     fn parse(source: &str, language: Language) -> FileAnalysis {
-        let result = JavaScriptAdapter::new(language)
+        let result = adapter(language, true)
             .unwrap()
             .analyze(source.as_bytes())
             .unwrap();
@@ -1097,9 +1104,45 @@ mod tests {
     }
 
     #[test]
+    fn raw_mode_keeps_test_code_without_a_filtered_view() {
+        let source = "\u{feff}import {test} from 'node:test';\r\nexport function production(x) {\r\n if (x) work();\r\n test('case', () => { if (x) work(); });\r\n return x;\r\n}\r\n";
+        for language in [Language::JavaScript, Language::TypeScript, Language::Tsx] {
+            let mut raw_adapter = adapter(language, false).unwrap();
+            assert!(raw_adapter.test_policy().is_none());
+            assert!(!raw_adapter.is_test_file("tests/example.test.js"));
+            let raw = raw_adapter.analyze(source.as_bytes()).unwrap();
+            assert!(raw.parsed(), "{:?}", raw.diagnostics);
+            assert!(raw.without_tests.is_none());
+            let mut filtered = parse(source, language);
+            let without_tests = filtered.without_tests.take().expect("recognized tests");
+            assert!(without_tests.functions.len() < raw.functions.len());
+            assert!(without_tests.source_lines < raw.source_lines);
+            assert_eq!(raw, filtered);
+        }
+    }
+
+    #[test]
+    fn factory_rejects_languages_outside_the_javascript_family() {
+        for language in [Language::Python, Language::Rust, Language::Gleam] {
+            for exclude_tests in [false, true] {
+                let Err(error) = adapter(language, exclude_tests) else {
+                    panic!("unexpected JavaScript adapter for {language:?}");
+                };
+                assert_eq!(
+                    error.to_string(),
+                    format!("JavaScript adapter does not support {}", language.id())
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_paths_are_javascript_owned_and_component_bounded() {
         for language in [Language::JavaScript, Language::TypeScript, Language::Tsx] {
-            let adapter = JavaScriptAdapter::new(language).unwrap();
+            let adapter = adapter(language, true).unwrap();
+            let policy = adapter.test_policy().unwrap();
+            assert_eq!(policy.version, "javascript-tests-v1");
+            assert_eq!(policy.path_patterns, TEST_PATHS);
             for path in [
                 "tests/a.ts",
                 "src/test/a.js",
@@ -1280,7 +1323,7 @@ mod tests {
                 language,
             );
             assert!(file.without_tests.is_none());
-            let bad = JavaScriptAdapter::new(language)
+            let bad = adapter(language, true)
                 .unwrap()
                 .analyze(b"import {test} from 'node:test'; test('broken',()=>{")
                 .unwrap();
@@ -1382,7 +1425,7 @@ mod tests {
 
     #[test]
     fn invalid_input_is_not_success() {
-        let mut adapter = JavaScriptAdapter::new(Language::TypeScript).unwrap();
+        let mut adapter = adapter(Language::TypeScript, false).unwrap();
         for source in [b"function {".as_slice(), b"\xff"] {
             let result = adapter.analyze(source).unwrap();
             assert!(!result.parsed());
@@ -1471,8 +1514,7 @@ interface Covariant<out out> { readonly value: out; }\n";
                     assert_eq!(file.functions.len(), 1);
                     assert_eq!(file.functions[0].complexity, 1);
                     assert_eq!(file.functions[0].source_lines, 1);
-                    let mut adapter = JavaScriptAdapter::new(language).unwrap();
-                    let tree = adapter.parser.parse(&source, None).unwrap();
+                    let tree = parser(language).unwrap().parse(&source, None).unwrap();
                     let mut stack = vec![tree.root_node()];
                     let mut arrows = 0;
                     while let Some(node) = stack.pop() {
@@ -1499,8 +1541,7 @@ interface Covariant<out out> { readonly value: out; }\n";
             let file = parse(source, language);
             assert!(file.functions.is_empty());
             assert_eq!(file.source_lines, 6);
-            let mut adapter = JavaScriptAdapter::new(language).unwrap();
-            let tree = adapter.parser.parse(source, None).unwrap();
+            let tree = parser(language).unwrap().parse(source, None).unwrap();
             let mut stack = vec![tree.root_node()];
             let mut kinds = Vec::new();
             while let Some(node) = stack.pop() {

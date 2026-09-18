@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, ensure};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::Write;
@@ -7,9 +7,9 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use crate::languages::{Language, PARSER_VERSIONS};
-use crate::metrics::{FileAnalysis, METRIC_VERSION};
+use crate::metrics::{FileAnalysis, METRIC_VERSION, TestExclusionAnalysis};
 
-pub const CACHE_SCHEMA: u32 = 2;
+pub const CACHE_SCHEMA: u32 = 3;
 const ANALYZER_SOURCES: &[(&str, &str)] = &[
     ("src/metrics.rs", include_str!("metrics.rs")),
     ("src/languages/mod.rs", include_str!("languages/mod.rs")),
@@ -44,19 +44,21 @@ pub fn analyzer_fingerprint() -> String {
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct Record {
+struct Record<T> {
     schema: u32,
     analyzer: String,
     oid: String,
     language: Language,
+    test_policy: Option<String>,
     analysis_sha256: String,
-    analysis: FileAnalysis,
+    analysis: T,
 }
 
 pub struct Cache {
     directory: Option<PathBuf>,
     fingerprint: String,
     memory: HashMap<(Language, String), Arc<FileAnalysis>>,
+    test_memory: HashMap<(Language, String, String), Arc<TestExclusionAnalysis>>,
     pub memory_hits: usize,
     pub disk_hits: usize,
     pub misses: usize,
@@ -110,37 +112,56 @@ impl Cache {
             directory,
             fingerprint: analyzer_fingerprint(),
             memory: HashMap::new(),
+            test_memory: HashMap::new(),
             memory_hits: 0,
             disk_hits: 0,
             misses: 0,
         })
     }
 
-    fn path(&self, language: Language, oid: &str) -> Result<Option<PathBuf>> {
+    fn path(
+        &self,
+        language: Language,
+        oid: &str,
+        test_policy: Option<&str>,
+    ) -> Result<Option<PathBuf>> {
         ensure!(
             (oid.len() == 40 || oid.len() == 64)
                 && oid.bytes().all(|byte| byte.is_ascii_hexdigit()),
             "Invalid blob object ID"
         );
+        if let Some(policy) = test_policy {
+            ensure!(
+                policy.len() == 64
+                    && policy
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+                "Invalid test-policy fingerprint"
+            );
+        }
         Ok(self.directory.as_ref().map(|directory| {
-            directory
-                .join(&self.fingerprint)
+            let namespace = directory.join(&self.fingerprint);
+            let namespace = match test_policy {
+                Some(policy) => namespace.join("test-exclusion").join(policy),
+                None => namespace.join("raw"),
+            };
+            namespace
                 .join(language.id())
                 .join(&oid[..2])
                 .join(format!("{oid}.json"))
         }))
     }
 
-    pub fn get(&mut self, language: Language, oid: &str) -> Result<Option<Arc<FileAnalysis>>> {
-        let key = (language, oid.to_owned());
-        if let Some(analysis) = self.memory.get(&key) {
-            self.memory_hits += 1;
-            return Ok(Some(Arc::clone(analysis)));
-        }
-        if let Some(path) = self.path(language, oid)? {
+    fn read<T: DeserializeOwned + Serialize>(
+        &self,
+        language: Language,
+        oid: &str,
+        test_policy: Option<&str>,
+    ) -> Result<Option<T>> {
+        if let Some(path) = self.path(language, oid, test_policy)? {
             match std::fs::read(&path) {
                 Ok(bytes) => {
-                    let record: Record = serde_json::from_slice(&bytes).with_context(|| {
+                    let record: Record<T> = serde_json::from_slice(&bytes).with_context(|| {
                         format!(
                             "Invalid cache {}; remove it or use --no-cache",
                             path.display()
@@ -150,7 +171,8 @@ impl Cache {
                         record.schema == CACHE_SCHEMA
                             && record.analyzer == self.fingerprint
                             && record.oid == oid
-                            && record.language == language,
+                            && record.language == language
+                            && record.test_policy.as_deref() == test_policy,
                         "Cache identity mismatch at {}; remove it or use --no-cache",
                         path.display()
                     );
@@ -163,10 +185,7 @@ impl Cache {
                         "Cache payload checksum mismatch at {}; remove it or use --no-cache",
                         path.display()
                     );
-                    let analysis = Arc::new(record.analysis);
-                    self.memory.insert(key, Arc::clone(&analysis));
-                    self.disk_hits += 1;
-                    return Ok(Some(analysis));
+                    return Ok(Some(record.analysis));
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
@@ -174,17 +193,17 @@ impl Cache {
                 }
             }
         }
-        self.misses += 1;
         Ok(None)
     }
 
-    pub fn insert(
-        &mut self,
+    fn write<T: Serialize>(
+        &self,
         language: Language,
         oid: &str,
-        analysis: FileAnalysis,
-    ) -> Result<Arc<FileAnalysis>> {
-        if let Some(path) = self.path(language, oid)? {
+        test_policy: Option<&str>,
+        analysis: &T,
+    ) -> Result<()> {
+        if let Some(path) = self.path(language, oid, test_policy)? {
             let parent = path.parent().context("Missing cache parent")?;
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("Creating cache {}", parent.display()))?;
@@ -193,7 +212,8 @@ impl Cache {
                 analyzer: self.fingerprint.clone(),
                 oid: oid.to_owned(),
                 language,
-                analysis: analysis.clone(),
+                test_policy: test_policy.map(str::to_owned),
+                analysis,
                 analysis_sha256: format!("{:x}", Sha256::digest(serde_json::to_vec(&analysis)?)),
             };
             let mut temporary =
@@ -207,9 +227,79 @@ impl Cache {
                 .persist(&path)
                 .with_context(|| format!("Persisting cache {}", path.display()))?;
         }
+        Ok(())
+    }
+
+    pub fn get(&mut self, language: Language, oid: &str) -> Result<Option<Arc<FileAnalysis>>> {
+        let key = (language, oid.to_owned());
+        if let Some(analysis) = self.memory.get(&key) {
+            self.memory_hits += 1;
+            return Ok(Some(Arc::clone(analysis)));
+        }
+        if let Some(analysis) = self.read::<FileAnalysis>(language, oid, None)? {
+            ensure!(
+                analysis.without_tests.is_none(),
+                "Raw cache contains test-exclusion analysis; remove it or use --no-cache"
+            );
+            let analysis = Arc::new(analysis);
+            self.memory.insert(key, Arc::clone(&analysis));
+            self.disk_hits += 1;
+            return Ok(Some(analysis));
+        }
+        self.misses += 1;
+        Ok(None)
+    }
+
+    pub fn insert(
+        &mut self,
+        language: Language,
+        oid: &str,
+        analysis: FileAnalysis,
+    ) -> Result<Arc<FileAnalysis>> {
+        ensure!(
+            analysis.without_tests.is_none(),
+            "Cannot store test-exclusion analysis in the raw cache"
+        );
+        self.write(language, oid, None, &analysis)?;
         let analysis = Arc::new(analysis);
         self.memory
             .insert((language, oid.to_owned()), Arc::clone(&analysis));
+        Ok(analysis)
+    }
+
+    pub fn get_test_exclusion(
+        &mut self,
+        language: Language,
+        oid: &str,
+        policy: &str,
+    ) -> Result<Option<Arc<TestExclusionAnalysis>>> {
+        let key = (language, oid.to_owned(), policy.to_owned());
+        if let Some(analysis) = self.test_memory.get(&key) {
+            self.memory_hits += 1;
+            return Ok(Some(Arc::clone(analysis)));
+        }
+        if let Some(analysis) = self.read(language, oid, Some(policy))? {
+            let analysis = Arc::new(analysis);
+            self.test_memory.insert(key, Arc::clone(&analysis));
+            self.disk_hits += 1;
+            return Ok(Some(analysis));
+        }
+        Ok(None)
+    }
+
+    pub fn insert_test_exclusion(
+        &mut self,
+        language: Language,
+        oid: &str,
+        policy: &str,
+        analysis: TestExclusionAnalysis,
+    ) -> Result<Arc<TestExclusionAnalysis>> {
+        self.write(language, oid, Some(policy), &analysis)?;
+        let analysis = Arc::new(analysis);
+        self.test_memory.insert(
+            (language, oid.to_owned(), policy.to_owned()),
+            Arc::clone(&analysis),
+        );
         Ok(analysis)
     }
 }
@@ -239,7 +329,10 @@ mod tests {
         cache
             .insert(Language::TypeScript, &oid, data.clone())
             .unwrap();
-        let path = cache.path(Language::TypeScript, &oid).unwrap().unwrap();
+        let path = cache
+            .path(Language::TypeScript, &oid, None)
+            .unwrap()
+            .unwrap();
         let mut warm = Cache::new(Some(dir.path()), false, repo.path()).unwrap();
         assert_eq!(
             *warm.get(Language::TypeScript, &oid).unwrap().unwrap(),
@@ -275,6 +368,122 @@ mod tests {
         std::os::unix::fs::symlink(repo.path(), &link).unwrap();
         assert!(Cache::new(Some(&link.join("cache")), false, repo.path()).is_err());
         assert!(!repo.path().join("cache").exists());
+    }
+
+    #[test]
+    fn derived_cache_distinguishes_missing_from_no_matches_and_checks_policy_identity() {
+        let repo = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let oid = "b".repeat(40);
+        let policy = "c".repeat(64);
+        let other_policy = "d".repeat(64);
+        let mut cache = Cache::new(Some(directory.path()), false, repo.path()).unwrap();
+        assert!(
+            cache
+                .get_test_exclusion(Language::Rust, &oid, &policy)
+                .unwrap()
+                .is_none()
+        );
+        let no_matches = TestExclusionAnalysis {
+            without_tests: None,
+        };
+        cache
+            .insert_test_exclusion(Language::Rust, &oid, &policy, no_matches.clone())
+            .unwrap();
+        assert_eq!(
+            *cache
+                .get_test_exclusion(Language::Rust, &oid, &policy)
+                .unwrap()
+                .unwrap(),
+            no_matches
+        );
+        assert!(
+            cache
+                .get_test_exclusion(Language::Rust, &oid, &other_policy)
+                .unwrap()
+                .is_none()
+        );
+        assert!(cache.get(Language::Rust, &oid).unwrap().is_none());
+        let mut warm = Cache::new(Some(directory.path()), false, repo.path()).unwrap();
+        assert_eq!(
+            *warm
+                .get_test_exclusion(Language::Rust, &oid, &policy)
+                .unwrap()
+                .unwrap(),
+            no_matches
+        );
+        let path = warm
+            .path(Language::Rust, &oid, Some(&policy))
+            .unwrap()
+            .unwrap();
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        record["test_policy"] = other_policy.into();
+        std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        assert!(
+            Cache::new(Some(directory.path()), false, repo.path())
+                .unwrap()
+                .get_test_exclusion(Language::Rust, &oid, &policy)
+                .unwrap_err()
+                .to_string()
+                .contains("identity mismatch")
+        );
+        assert!(serde_json::from_str::<TestExclusionAnalysis>("{}").is_err());
+        assert!(
+            serde_json::from_str::<TestExclusionAnalysis>(r#"{"without_tests":null,"unknown":1}"#)
+                .is_err()
+        );
+        assert!(warm.path(Language::Rust, &oid, Some("../invalid")).is_err());
+    }
+
+    #[test]
+    fn derived_checksum_failures_do_not_affect_raw_cache_access() {
+        let repo = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let oid = "a".repeat(40);
+        let policy = "b".repeat(64);
+        let mut cache = Cache::new(Some(directory.path()), false, repo.path()).unwrap();
+        let raw = FileAnalysis {
+            physical_lines: 1,
+            source_lines: 1,
+            functions: vec![],
+            diagnostics: vec![],
+            without_tests: None,
+        };
+        cache.insert(Language::Rust, &oid, raw.clone()).unwrap();
+        cache
+            .insert_test_exclusion(
+                Language::Rust,
+                &oid,
+                &policy,
+                TestExclusionAnalysis {
+                    without_tests: None,
+                },
+            )
+            .unwrap();
+        let path = cache
+            .path(Language::Rust, &oid, Some(&policy))
+            .unwrap()
+            .unwrap();
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        record["analysis_sha256"] = "0".repeat(64).into();
+        std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        let mut warm = Cache::new(Some(directory.path()), false, repo.path()).unwrap();
+        assert_eq!(*warm.get(Language::Rust, &oid).unwrap().unwrap(), raw);
+        assert!(
+            warm.get_test_exclusion(Language::Rust, &oid, &policy)
+                .unwrap_err()
+                .to_string()
+                .contains("checksum mismatch")
+        );
+        let mut invalid_raw = raw;
+        invalid_raw.without_tests = Some(crate::metrics::TestFilteredAnalysis {
+            source_lines: 0,
+            functions: vec![],
+            regions: vec![],
+        });
+        assert!(warm.insert(Language::Rust, &oid, invalid_raw).is_err());
     }
 
     #[test]

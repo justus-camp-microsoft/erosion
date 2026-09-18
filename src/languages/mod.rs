@@ -6,6 +6,7 @@ mod tree;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -70,6 +71,12 @@ pub struct LanguageTestPolicy {
     pub syntax_rules: &'static [&'static str],
 }
 
+impl LanguageTestPolicy {
+    pub fn fingerprint(&self) -> Result<String> {
+        Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(self)?)))
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct TestExclusionPolicy {
     pub version: &'static str,
@@ -77,19 +84,19 @@ pub struct TestExclusionPolicy {
 }
 
 pub trait LanguageAdapter {
-    fn test_policy(&self) -> LanguageTestPolicy;
+    fn test_policy(&self) -> Option<LanguageTestPolicy>;
     fn is_test_file(&self, path: &str) -> bool;
     fn analyze(&mut self, source: &[u8]) -> Result<FileAnalysis>;
 }
 
-pub fn adapter(language: Language) -> Result<Box<dyn LanguageAdapter>> {
+pub fn adapter(language: Language, exclude_tests: bool) -> Result<Box<dyn LanguageAdapter>> {
     match language {
         Language::JavaScript | Language::TypeScript | Language::Tsx => {
-            Ok(Box::new(javascript::JavaScriptAdapter::new(language)?))
+            javascript::adapter(language, exclude_tests)
         }
-        Language::Python => Ok(Box::new(python::PythonAdapter::new()?)),
-        Language::Rust => Ok(Box::new(rust::RustAdapter::new()?)),
-        Language::Gleam => Ok(Box::new(gleam::GleamAdapter::new()?)),
+        Language::Python => python::adapter(exclude_tests),
+        Language::Rust => rust::adapter(exclude_tests),
+        Language::Gleam => gleam::adapter(exclude_tests),
     }
 }
 
@@ -110,10 +117,9 @@ mod tests {
             (Language::Rust, "fn value(x: i32) -> i32 { x }"),
             (Language::Gleam, "pub fn value(x: Int) -> Int { x }"),
         ] {
-            let analysis = adapter(language)
-                .unwrap()
-                .analyze(source.as_bytes())
-                .unwrap();
+            let mut adapter = adapter(language, false).unwrap();
+            assert!(adapter.test_policy().is_none());
+            let analysis = adapter.analyze(source.as_bytes()).unwrap();
             assert!(
                 analysis.parsed(),
                 "{language:?}: {:?}",
@@ -127,7 +133,7 @@ mod tests {
     #[test]
     fn javascript_adapter_rejects_other_languages() {
         for language in [Language::Python, Language::Rust, Language::Gleam] {
-            let error = javascript::JavaScriptAdapter::new(language)
+            let error = javascript::adapter(language, false)
                 .err()
                 .expect("Non-JavaScript languages must be rejected");
             assert_eq!(

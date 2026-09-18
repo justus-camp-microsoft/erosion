@@ -4,9 +4,9 @@ use tree_sitter::{Node, Parser};
 
 use super::{
     LanguageAdapter, LanguageTestPolicy,
-    tree::{self, SyntaxRules},
+    tree::{self, LanguageRules, SyntaxRules, TestDetector},
 };
-use crate::metrics::{FileAnalysis, TestRegion};
+use crate::metrics::TestRegion;
 
 const TEST_PATHS: &[&str] = &[
     "**/test/**",
@@ -40,46 +40,46 @@ const DECISIONS: &[&str] = &[
     "boolean_operator",
 ];
 
-pub struct PythonAdapter {
-    parser: Parser,
+struct PythonRules;
+
+struct PythonTestDetector {
     test_paths: tree::TestPaths,
 }
 
-impl PythonAdapter {
-    pub fn new() -> Result<Self> {
-        let grammar = tree_sitter_python::LANGUAGE.into();
-        let mut parser = Parser::new();
-        parser
-            .set_language(&grammar)
-            .context("Loading Python grammar")?;
-        for kind in DECISIONS.iter().chain(
-            [
-                "function_definition",
-                "lambda",
-                "case_clause",
-                "else_clause",
-                "block",
-                "expression_statement",
-                "string",
-                "string_start",
-                "comment",
-            ]
-            .iter(),
-        ) {
-            ensure!(
-                grammar.id_for_node_kind(kind, true) != 0,
-                "Python grammar missing {kind}"
-            );
-        }
+pub fn adapter(exclude_tests: bool) -> Result<Box<dyn LanguageAdapter>> {
+    tree::adapter::<PythonRules>(parser()?, exclude_tests)
+}
+
+fn parser() -> Result<Parser> {
+    let grammar = tree_sitter_python::LANGUAGE.into();
+    let mut parser = Parser::new();
+    parser
+        .set_language(&grammar)
+        .context("Loading Python grammar")?;
+    for kind in DECISIONS.iter().chain(
+        [
+            "function_definition",
+            "lambda",
+            "case_clause",
+            "else_clause",
+            "block",
+            "expression_statement",
+            "string",
+            "string_start",
+            "comment",
+        ]
+        .iter(),
+    ) {
         ensure!(
-            grammar.field_id_for_name("body").is_some(),
-            "Python grammar missing callable body"
+            grammar.id_for_node_kind(kind, true) != 0,
+            "Python grammar missing {kind}"
         );
-        Ok(Self {
-            parser,
-            test_paths: tree::TestPaths::new(TEST_PATHS)?,
-        })
     }
+    ensure!(
+        grammar.field_id_for_name("body").is_some(),
+        "Python grammar missing callable body"
+    );
+    Ok(parser)
 }
 
 // A bare capture, wildcard, or parenthesized/as-bound version is a catch-all.
@@ -842,7 +842,7 @@ impl<'tree, 'source> TestBindings<'tree, 'source> {
     }
 }
 
-impl SyntaxRules for PythonAdapter {
+impl SyntaxRules for PythonRules {
     fn callable(node: Node<'_>) -> bool {
         matches!(node.kind(), "function_definition" | "lambda")
             && node.child_by_field_name("body").is_some()
@@ -899,13 +899,19 @@ impl SyntaxRules for PythonAdapter {
                 .all(|child| matches!(child.kind(), "comment" | "line_continuation")))
         .then_some("Expected a non-empty Python body")
     }
-
-    fn test_regions(root: Node<'_>, source: &[u8]) -> Vec<TestRegion> {
-        TestBindings::collect(root, source).regions()
-    }
 }
 
-impl LanguageAdapter for PythonAdapter {
+impl LanguageRules for PythonRules {
+    type Tests = PythonTestDetector;
+}
+
+impl TestDetector for PythonTestDetector {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            test_paths: tree::TestPaths::new(TEST_PATHS)?,
+        })
+    }
+
     fn test_policy(&self) -> LanguageTestPolicy {
         LanguageTestPolicy {
             version: TEST_POLICY_VERSION,
@@ -918,28 +924,42 @@ impl LanguageAdapter for PythonAdapter {
         self.test_paths.matches(path)
     }
 
-    fn analyze(&mut self, source: &[u8]) -> Result<FileAnalysis> {
-        tree::analyze::<Self>(&mut self.parser, source)
+    fn test_regions(&self, root: Node<'_>, source: &[u8]) -> Result<Vec<TestRegion>> {
+        Ok(TestBindings::collect(root, source).regions())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::FileAnalysis;
 
     fn parse(source: &str) -> FileAnalysis {
-        let result = PythonAdapter::new()
-            .unwrap()
-            .analyze(source.as_bytes())
-            .unwrap();
+        let result = adapter(true).unwrap().analyze(source.as_bytes()).unwrap();
         assert!(result.parsed(), "{:?}", result.diagnostics);
         result
     }
 
     #[test]
+    fn raw_mode_keeps_test_code_without_a_filtered_view() {
+        let source = "\u{feff}import pytest\r\ndef production(flag):\r\n    @pytest.fixture\r\n    def resource():\r\n        assert flag\r\n        return 1\r\n    return flag if flag else None\r\n";
+        let mut raw_adapter = adapter(false).unwrap();
+        assert!(raw_adapter.test_policy().is_none());
+        assert!(!raw_adapter.is_test_file("tests/test_example.py"));
+        let raw = raw_adapter.analyze(source.as_bytes()).unwrap();
+        assert!(raw.parsed(), "{:?}", raw.diagnostics);
+        assert!(raw.without_tests.is_none());
+        let mut filtered = parse(source);
+        let without_tests = filtered.without_tests.take().expect("recognized tests");
+        assert!(without_tests.functions.len() < raw.functions.len());
+        assert!(without_tests.source_lines < raw.source_lines);
+        assert_eq!(raw, filtered);
+    }
+
+    #[test]
     fn python_owns_component_bounded_case_sensitive_test_paths() {
-        let adapter = PythonAdapter::new().unwrap();
-        let policy = adapter.test_policy();
+        let adapter = adapter(true).unwrap();
+        let policy = adapter.test_policy().unwrap();
         assert_eq!(policy.version, TEST_POLICY_VERSION);
         assert_eq!(policy.path_patterns, TEST_PATHS);
         assert_eq!(policy.syntax_rules, TEST_SYNTAX_RULES);
@@ -1330,19 +1350,19 @@ def production(Base):
         struct RawPython;
         impl SyntaxRules for RawPython {
             fn callable(node: Node<'_>) -> bool {
-                PythonAdapter::callable(node)
+                PythonRules::callable(node)
             }
             fn decisions(node: Node<'_>) -> u64 {
-                PythonAdapter::decisions(node)
+                PythonRules::decisions(node)
             }
             fn name(node: Node<'_>, source: &[u8]) -> String {
-                PythonAdapter::name(node, source)
+                PythonRules::name(node, source)
             }
             fn ignored(node: Node<'_>, source: &[u8]) -> bool {
-                PythonAdapter::ignored(node, source)
+                PythonRules::ignored(node, source)
             }
             fn validation_error(node: Node<'_>) -> Option<&'static str> {
-                PythonAdapter::validation_error(node)
+                PythonRules::validation_error(node)
             }
         }
         for source in [
@@ -1351,9 +1371,17 @@ def production(Base):
             "import unittest\nclass Checks(unittest.TestCase):\n    def broken(:\n",
             "import pytest\n@pytest.fixture\ndef broken():\n    # empty body\n",
         ] {
-            let mut adapter = PythonAdapter::new().unwrap();
-            let mut file = adapter.analyze(source.as_bytes()).unwrap();
-            let raw = tree::analyze::<RawPython>(&mut adapter.parser, source.as_bytes()).unwrap();
+            let mut file = adapter(true).unwrap().analyze(source.as_bytes()).unwrap();
+            let raw = tree::analyze::<RawPython, _>(
+                &mut parser().unwrap(),
+                source.as_bytes(),
+                &tree::AllCode,
+            )
+            .unwrap();
+            assert_eq!(
+                adapter(false).unwrap().analyze(source.as_bytes()).unwrap(),
+                raw
+            );
             let filtered = file.without_tests.take();
             assert_eq!(file, raw);
             if raw.parsed() {
@@ -1495,7 +1523,7 @@ def production(Base):
         let empty = parse("# only a comment\n");
         assert_eq!(empty.source_lines, 0);
         assert!(empty.functions.is_empty());
-        let mut adapter = PythonAdapter::new().unwrap();
+        let mut adapter = adapter(false).unwrap();
         for bad in [
             b"def broken(:\n".as_slice(),
             b"def f():\n  return \xff",
